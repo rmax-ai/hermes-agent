@@ -139,6 +139,7 @@ def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
 
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PASS_REF_RE = re.compile(r"\$\(pass\s+(\S+)\)")
 
 # Env var names that influence how the next subprocess executes —
 # never writable through ``save_env_value``. Anything that controls
@@ -5305,16 +5306,55 @@ def _expand_env_vars(obj):
     ``os.environ``) are kept verbatim so callers can detect them.
     """
     if isinstance(obj, str):
-        return re.sub(
+        expanded = re.sub(
             r"\${([^}]+)}",
             lambda m: os.environ.get(m.group(1), m.group(0)),
             obj,
         )
+        if "$(pass " in expanded:
+            expanded = _resolve_pass_ref(expanded)
+        return expanded
     if isinstance(obj, dict):
         return {k: _expand_env_vars(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_expand_env_vars(item) for item in obj]
     return obj
+
+
+def _resolve_pass_ref(value: str) -> str:
+    """Resolve ``$(pass <path>)`` references to their decrypted values.
+
+    If ``pass`` is not available or the entry doesn't exist, the raw
+    ``$(pass ...)`` string is returned verbatim so callers can detect and
+    report the failure.
+    """
+    if "$(pass " not in value:
+        return value
+
+    env = os.environ.copy()
+    pstore = os.path.join(str(get_hermes_home()), ".password-store")
+    env["PASSWORD_STORE_DIR"] = pstore
+
+    def _resolve_one(match: re.Match) -> str:
+        path = match.group(1)
+        try:
+            proc = subprocess.run(
+                ["pass", path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip().split("\n")[0]
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        return match.group(0)
+
+    try:
+        return _PASS_REF_RE.sub(_resolve_one, value)
+    except Exception:
+        return value
 
 
 def _items_by_unique_name(items):
@@ -5935,7 +5975,10 @@ def load_env() -> Dict[str, str]:
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, _, value = line.partition('=')
-                env_vars[key.strip()] = value.strip().strip('"\'')
+                value = value.strip().strip('"\'')
+                if "$(pass " in value:
+                    value = _resolve_pass_ref(value)
+                env_vars[key.strip()] = value
 
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
@@ -6326,8 +6369,11 @@ def get_env_value(key: str) -> Optional[str]:
     """Get a value from ~/.hermes/.env or environment."""
     # Check environment first
     if key in os.environ:
-        return os.environ[key]
-    
+        val = os.environ[key]
+        if "$(pass " in val:
+            return _resolve_pass_ref(val)
+        return val
+
     # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from utils import atomic_replace
 # alter arbitrary user env vars, but credentials are known to require
 # pure ASCII (they become HTTP header values).
 _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
+_PASS_REF_RE = re.compile(r"\$\(pass\s+(\S+)\)")
 
 # Names we've already warned about during this process, so repeated
 # load_hermes_dotenv() calls (user env + project env, gateway hot-reload,
@@ -143,6 +146,46 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
+def _resolve_pass_ref(value: str, *, hermes_home: Path) -> str:
+    """Resolve ``$(pass <path>)`` references to their decrypted values."""
+    if "$(pass " not in value:
+        return value
+
+    env = os.environ.copy()
+    env["PASSWORD_STORE_DIR"] = str(hermes_home / ".password-store")
+
+    def _resolve_one(match: re.Match[str]) -> str:
+        path = match.group(1)
+        try:
+            proc = subprocess.run(
+                ["pass", path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip().split("\n")[0]
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        return match.group(0)
+
+    try:
+        return _PASS_REF_RE.sub(_resolve_one, value)
+    except Exception:
+        return value
+
+
+def _resolve_pass_refs_in_env(*, hermes_home: Path) -> None:
+    """Replace pass refs already loaded into ``os.environ`` with real secrets."""
+    for key, value in list(os.environ.items()):
+        if "$(" not in value:
+            continue
+        resolved = _resolve_pass_ref(value, hermes_home=hermes_home)
+        if resolved != value:
+            os.environ[key] = resolved
+
+
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
@@ -236,10 +279,12 @@ def load_hermes_dotenv(
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
+        _resolve_pass_refs_in_env(hermes_home=home_path)
         loaded.append(user_env)
 
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        _resolve_pass_refs_in_env(hermes_home=home_path)
         loaded.append(project_env_path)
 
     _apply_external_secret_sources(home_path)
