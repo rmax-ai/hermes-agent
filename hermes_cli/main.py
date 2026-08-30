@@ -11093,7 +11093,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
-        "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
+        "model", "pairing", "pass", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -11652,6 +11652,28 @@ def main():
         help="Remove all fallback entries",
     )
     fallback_parser.set_defaults(func=cmd_fallback)
+
+    # =========================================================================
+    # pass command — passwordstore.org integration (Hermes GPG-encrypted store)
+    # =========================================================================
+    pass_parser = subparsers.add_parser(
+        "pass",
+        help="Manage credentials in the GPG-encrypted Hermes password store",
+    )
+
+    # Lazy import — only pays for itself when this subcommand is actually used.
+    from hermes_cli.pass_cli import register_cli as _register_pass_cli
+
+    _register_pass_cli(pass_parser)
+
+    def _dispatch_pass(args):  # noqa: ANN001
+        sub = getattr(args, "pass_command", None)
+        if sub is not None:
+            return args.func(args)
+        pass_parser.print_help()
+        return 0
+
+    pass_parser.set_defaults(func=_dispatch_pass)
 
     # =========================================================================
     # secrets command — external secret managers (currently: Bitwarden)
