@@ -1563,6 +1563,10 @@ class SendResult:
     # stream consumer can send the missing tail instead of marking a clipped
     # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # Seconds the platform demanded to wait before the next attempt
+    # (e.g. Telegram RetryAfter.retry_after). Honored by _send_with_retry so
+    # flood-control retries are not doomed to immediate 429s.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -3460,6 +3464,20 @@ class BasePlatformAdapter(ABC):
             # Retry with exponential backoff for transient errors
             for attempt in range(1, max_retries + 1):
                 delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                # Flood control: the platform dictates a minimum wait
+                # (Telegram RetryAfter). Retrying sooner guarantees another
+                # 429 — honor retry_after from the SendResult field, or parse
+                # it from the error string when the adapter did not pass it.
+                retry_after = getattr(result, "retry_after", None)
+                if not retry_after:
+                    _m = re.search(r"retry in\s+(\d+(?:\.\d+)?)\s*seconds?", error_str, re.IGNORECASE)
+                    if _m:
+                        try:
+                            retry_after = float(_m.group(1))
+                        except ValueError:
+                            retry_after = None
+                if retry_after:
+                    delay = max(delay, retry_after + 0.5)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,

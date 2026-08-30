@@ -1249,6 +1249,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=False,
                 error=str(exc),
                 retryable=(is_connect_timeout or not is_timeout),
+                retry_after=getattr(exc, "retry_after", None),
             )
 
         message_id = None
@@ -1333,6 +1334,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=False,
                 error=str(exc),
                 retryable=(is_connect_timeout or not is_timeout),
+                retry_after=getattr(exc, "retry_after", None),
             )
         return SendResult(success=True, message_id=message_id)
 
