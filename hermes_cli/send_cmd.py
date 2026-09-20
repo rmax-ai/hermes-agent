@@ -251,6 +251,16 @@ def _load_hermes_env() -> None:
         except Exception:
             pass
 
+    # Resolve ``$(pass <path>)`` refs exactly like the canonical loader
+    # (hermes_cli.env_loader). The minimal dotenv load above leaves them
+    # literal, so pass-backed bot tokens reached the platform APIs as the
+    # string "$(pass ...)" and sends failed with opaque backend errors.
+    try:
+        from hermes_cli.env_loader import _resolve_pass_refs_in_env
+        _resolve_pass_refs_in_env(hermes_home=home)
+    except Exception:
+        pass
+
     # Step 2: bridge top-level config.yaml values into the environment so
     # gateway.config.load_gateway_config() sees them. Scalars only; don't
     # override values already in the env.
