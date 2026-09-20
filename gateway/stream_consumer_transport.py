@@ -481,6 +481,13 @@ class StreamTransportMixin:
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
+        if (
+            isinstance(getattr(result, "raw_response", None), dict)
+            and result.raw_response.get("skipped")
+        ):
+            # A replaceable outbound edit may be coalesced or dropped while
+            # queued. The visible preview is still the previous text.
+            return True
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST

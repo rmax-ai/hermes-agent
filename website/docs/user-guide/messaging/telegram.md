@@ -83,6 +83,32 @@ Notes:
   profile-text indicator.
 - Off by default, since it mutates the bot's global profile.
 
+### Outbound mutation limiter
+
+Hermes spaces Telegram Bot API mutations through one limiter for each connected
+bot/profile. It covers messages, edits, media, drafts, callbacks, reactions,
+typing indicators, and lifecycle mutations. Read-only probes such as
+`getMe` and `getChat` are not limited.
+
+The limiter is enabled by default. Tune it under the Telegram platform's
+`extra` settings, or disable it for a trusted local Bot API endpoint:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      telegram_outbound_limiter:
+        enabled: true
+        global_interval: 0.04       # seconds between bot-wide mutations
+        per_chat_interval: 1.0      # seconds between mutations in one route
+        retry_after_buffer: 0.25    # seconds added to Telegram flood waits
+        max_queue_size: 512
+```
+
+Durable final messages and control prompts are admitted ahead of replaceable
+stream/status updates and best-effort UI work. A clean gateway shutdown closes
+the limiter without replaying queued payloads.
+
 ### Cold-boot pending queue (Optional)
 
 By default the adapter drops server-side pending updates on a cold boot

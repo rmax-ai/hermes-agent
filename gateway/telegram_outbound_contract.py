@@ -1,9 +1,9 @@
 """Telegram outbound mutation contract and call-site inventory.
 
-This module is the design contract for issue #2.  It is intentionally not imported by
-the Telegram adapter and does not throttle, queue, retry, persist, or otherwise change
-runtime behavior.  A later limiter can consume this contract without rediscovering the
-semantics from individual ``Bot`` calls.
+This module is the design contract for issue #2.  The Telegram adapter imports the
+catalog to classify each physical Bot API mutation before submitting it to its
+adapter-owned limiter.  This module itself does not throttle, queue, retry, persist,
+or otherwise execute mutations.
 
 The implementation lives in
 ``plugins/platforms/telegram/adapter.py``.  The old
@@ -37,10 +37,11 @@ same chat.  In particular, a final message cannot overtake an earlier chunk.
   same user-visible payload merely because confirmation timed out.
 * ``none`` means this best-effort mutation has no replay policy.
 
-``TelegramOutboundMetadata`` is the future queue item contract.  ``coalescing_key``
+``TelegramOutboundMetadata`` is the queue item contract.  ``coalescing_key``
 is an actual key supplied by the caller, not a payload hash.  Durable items must
 leave it unset; replaceable items must provide it.  The current metadata dictionaries
-used for routing remain unchanged because this module is not runtime wiring.
+used for routing remain unchanged; the adapter materializes this typed metadata at
+the physical mutation boundary.
 
 Routing and ordering invariants
 -------------------------------
@@ -57,7 +58,7 @@ Routing and ordering invariants
   ``thread_id`` and maps it to ``message_thread_id``; it has no live adapter
   state or shared limiter.
 * ``TelegramAdapter`` already serializes text and media API calls with a
-  re-entrant per-chat lock.  The future queue must preserve that ordering.  A
+  re-entrant per-chat lock.  The adapter-owned queue must preserve that ordering.  A
   long text response is several ``sendMessage`` mutations: chunks are sent in
   order, continuation chunks reply-chain to the preceding message, and the
   delivered message IDs are retained.  A partial result must resume only the
@@ -72,10 +73,10 @@ Routing and ordering invariants
   returns a failure without a legacy resend, because the rich request may have
   landed.
 
-Budget semantics (future limiter only)
+Budget semantics
 --------------------------------------
 
-There is no limiter in this change.  When one is added:
+The adapter-owned limiter applies these rules:
 
 * The global bucket is per Telegram bot credential and counts every Bot API
   mutation attempt, including retries and fallback attempts.  Separate credentials
@@ -95,7 +96,7 @@ There is no limiter in this change.  When one is added:
   chat to interleave.
 * Existing short flood waits are bounded inline.  Long Telegram ``retry_after``
   values return a typed flood failure and arm the adapter's per-chat cooldown
-  instead of sleeping on the gateway loop.  The future limiter should honor that
+  instead of sleeping on the gateway loop.  The limiter should honor that
   cooldown and must not probe the chat by sending more mutations.
 
 Queue pressure, shutdown, and restart
@@ -120,8 +121,8 @@ Queue pressure, shutdown, and restart
   Cron's durable delivery handoff/execution ledger remains the source of restart
   recovery for cron work; an uncertain claimed send is not blindly replayed.
 * The standalone ``standalone_sender_fn`` path constructs a fresh PTB ``Bot``.
-  It does not share the live adapter's per-chat lock, cooldown map, or future
-  queue.  Its text sender retries bounded transient 5xx/429 responses but never
+  It does not share the live adapter's per-chat lock, cooldown map, or
+  adapter-owned queue.  Its text sender retries bounded transient 5xx/429 responses but never
   retries timeouts; media has only its explicit thread/parse fallbacks.  A
   standalone timeout remains ambiguous.
 * Cron live delivery distinguishes a timeout before coroutine dispatch from one
@@ -229,7 +230,7 @@ class TelegramMutation(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class TelegramOutboundMetadata:
-    """Typed metadata a future Telegram outbound queue must receive.
+    """Typed metadata supplied to the Telegram outbound queue.
 
     ``operation`` identifies the catalog row.  ``coalescing_key`` is scoped
     identity plus destination plus lane, never message content.

@@ -16,7 +16,18 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter():
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "telegram_outbound_limiter": {
+                    "global_interval": 0,
+                    "per_chat_interval": 0,
+                }
+            },
+        )
+    )
     adapter._rich_messages_enabled = False
     adapter._bot = AsyncMock()
     adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))

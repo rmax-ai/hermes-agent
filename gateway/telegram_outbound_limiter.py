@@ -195,7 +195,7 @@ class TelegramOutboundLimiter:
             return self._completed_awaitable()
         if self._worker is not None and not self._worker.done():
             return self._completed_awaitable()
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         self._worker = loop.create_task(
             self._run_loop(), name="telegram-outbound-limiter"
         )
@@ -203,7 +203,7 @@ class TelegramOutboundLimiter:
 
     @staticmethod
     def _completed_awaitable() -> asyncio.Future[None]:
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         completed: asyncio.Future[None] = loop.create_future()
         completed.set_result(None)
         return completed
@@ -262,7 +262,7 @@ class TelegramOutboundLimiter:
             retry_ambiguity=retry_ambiguity,
             mutation=mutation,
         )
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         future: asyncio.Future[T] = loop.create_future()
         request = _QueuedMutation(
             chat_key=chat_key,
