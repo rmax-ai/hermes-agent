@@ -652,6 +652,67 @@ class TestSetupVerboseLogging:
         assert len(verbose_handlers) == 1
 
 
+class TestTelegramExtSuppression:
+    """telegram.ext (and descendants) DEBUG chatter is suppressed at WARNING.
+
+    Regression for #25: python-telegram-bot's ``telegram.ext.ExtBot`` logger
+    was ~58% of all log records scanned.  Both setup_logging() and
+    setup_verbose_logging() raise ``telegram.ext`` to WARNING via
+    ``_NOISY_LOGGERS``, while leaving unrelated Telegram loggers
+    (``telegram.request``) and Hermes gateway loggers untouched.
+    """
+
+    @staticmethod
+    def _reset_telegram_ext():
+        # The module stores logger objects in the global registry and the
+        # autouse fixture only resets the init sentinel + root handlers, so
+        # clear the level here to prove the *entry point* sets it.
+        logging.getLogger("telegram.ext").setLevel(logging.NOTSET)
+
+    def test_setup_logging_raises_telegram_ext(self, hermes_home):
+        self._reset_telegram_ext()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert logging.getLogger("telegram.ext").level == logging.WARNING
+
+    def test_setup_verbose_logging_raises_telegram_ext(self, hermes_home):
+        self._reset_telegram_ext()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.setup_verbose_logging()
+        assert logging.getLogger("telegram.ext").level == logging.WARNING
+
+    def test_descendant_inherits_warning(self, hermes_home):
+        self._reset_telegram_ext()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert (
+            logging.getLogger("telegram.ext.ExtBot").getEffectiveLevel()
+            == logging.WARNING
+        )
+
+    def test_descendant_inherits_warning_verbose(self, hermes_home):
+        self._reset_telegram_ext()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.setup_verbose_logging()
+        assert (
+            logging.getLogger("telegram.ext.ExtBot").getEffectiveLevel()
+            == logging.WARNING
+        )
+
+    def test_unrelated_telegram_logger_not_raised(self, hermes_home):
+        # telegram.request is a sibling of telegram.ext — the change must not
+        # raise it (transport/network diagnostics stay visible).
+        request_logger = logging.getLogger("telegram.request")
+        before = request_logger.level
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert request_logger.level == before
+        assert "telegram.request" not in hermes_logging._NOISY_LOGGERS
+
+    def test_existing_noisy_loggers_unchanged(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        for name in ("openai", "httpx", "httpcore", "urllib3", "websockets"):
+            assert logging.getLogger(name).level >= logging.WARNING
+        assert "telegram.ext" in hermes_logging._NOISY_LOGGERS
+
+
 class TestAddRotatingHandler:
     """_add_rotating_handler() is idempotent and creates the directory."""
 

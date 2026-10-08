@@ -131,6 +131,11 @@ _NOISY_LOGGERS = (
     "websockets",
     "charset_normalizer",
     "markdown_it",
+    # python-telegram-bot extension chatter (e.g. telegram.ext.ExtBot) is
+    # pure library DEBUG with no Hermes semantics; it was ~58% of all log
+    # records.  Scoped to telegram.ext (and descendants via normal logger
+    # inheritance) so telegram.request / gateway telemetry stay visible.
+    "telegram.ext",
 )
 
 
