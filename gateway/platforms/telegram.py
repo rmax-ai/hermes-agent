@@ -9,11 +9,13 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
 import os
 import tempfile
+import time
 import html as _html
 import re
 from datetime import datetime, timezone
@@ -107,6 +109,57 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 
 
 MAX_COMMANDS_PER_SCOPE = 30
+
+
+@dataclasses.dataclass
+class DeliveryReceipt(SendResult):
+    """Successful scheduled-send result with normalized receipt fields."""
+
+    run_id: Optional[str] = None
+    payload_sha256: Optional[str] = None
+    delivery_kind: Optional[str] = None
+    delivered_at: Optional[str] = None
+
+    @property
+    def platform_message_id(self) -> Optional[str]:
+        return self.message_id
+
+
+async def send_scheduled_output_standalone(
+    config: PlatformConfig,
+    text: str,
+    *,
+    destination: str,
+    run_id: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    job_name: str = "cron job",
+) -> SendResult:
+    """Send scheduled output through Telegram without a running gateway."""
+    if not TELEGRAM_AVAILABLE or not getattr(config, "token", None):
+        return SendResult(
+            success=False,
+            error="Telegram scheduled output requires the Telegram SDK and bot token",
+        )
+    adapter = TelegramAdapter(config)
+    try:
+        proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
+        if proxy and HTTPXRequest is not None:
+            adapter._bot = Bot(
+                token=config.token,
+                request=HTTPXRequest(proxy=proxy),
+                get_updates_request=HTTPXRequest(proxy=proxy),
+            )
+        else:
+            adapter._bot = Bot(token=config.token)
+        return await adapter.send_scheduled_output(
+            text,
+            destination=destination,
+            run_id=run_id,
+            metadata=metadata,
+            job_name=job_name,
+        )
+    except Exception as exc:
+        return SendResult(success=False, error=str(exc), retryable=False)
 
 
 def check_telegram_requirements() -> bool:
@@ -334,6 +387,146 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+# ── Process-wide per-chat send/edit budget ────────────────────────────────
+# Telegram enforces flood control per CHAT, but every gateway stream owns its
+# own edit timer (stream_consumer._current_edit_interval) and every cron /
+# command reply sends independently.  N concurrent writers into one chat
+# therefore each spend that chat's budget as if they were alone, and the
+# platform throttles all of them: "flood control on send" retries plus
+# MarkdownV2→plaintext downgrades during long interactive sessions
+# (rmax-ai/system-review#30).  One token bucket per chat_id, shared by every
+# adapter instance in this process, makes the budget explicit and shared; a
+# 429's retry_after is fed back as a chat-wide cooldown so every caller — not
+# just the one that got throttled — stops spending it.
+DEFAULT_TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN = 20
+TELEGRAM_CHAT_BUDGET_BURST = 3
+
+
+class ChatSendBudget:
+    """Per-chat token bucket shared by every stream writing to one chat.
+
+    ``per_minute`` is the sustained rate (1 token per ``60 / per_minute``
+    seconds); ``burst`` is how many calls may go out immediately before pacing
+    starts.  A 429 calls :meth:`note_flood`, which drains the bucket and holds
+    the whole chat for ``retry_after`` seconds instead of only sleeping the
+    caller that happened to be throttled.
+    """
+
+    def __init__(
+        self,
+        per_minute: int = DEFAULT_TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN,
+        burst: int = TELEGRAM_CHAT_BUDGET_BURST,
+    ) -> None:
+        self._tokens: Dict[str, float] = {}
+        self._updated: Dict[str, float] = {}
+        self._cooldown_until: Dict[str, float] = {}
+        self.burst = TELEGRAM_CHAT_BUDGET_BURST
+        # Injectable for tests: a fake clock + sleep pair lets a test exercise a
+        # full minute of pacing without waiting a minute.
+        self._clock: Any = time.monotonic
+        self._sleep: Any = asyncio.sleep
+        self.configure(per_minute, burst)
+
+    def configure(self, per_minute: int, burst: Optional[int] = None) -> None:
+        try:
+            per_minute = int(per_minute)
+        except (TypeError, ValueError):
+            per_minute = DEFAULT_TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN
+        self.per_minute = max(1, per_minute)
+        self.interval = 60.0 / self.per_minute
+        if burst is not None:
+            try:
+                burst = int(burst)
+            except (TypeError, ValueError):
+                burst = TELEGRAM_CHAT_BUDGET_BURST
+            self.burst = max(1, burst)
+
+    def reset(self) -> None:
+        """Drop all per-chat state (reconnect / tests)."""
+        self._tokens.clear()
+        self._updated.clear()
+        self._cooldown_until.clear()
+
+    def cooldown_remaining(self, chat_id: Any) -> float:
+        """Seconds the chat is held by a platform-imposed 429 cooldown."""
+        key = str(chat_id)
+        until = self._cooldown_until.get(key)
+        if until is None:
+            return 0.0
+        remaining = until - self._clock()
+        if remaining <= 0.0:
+            self._cooldown_until.pop(key, None)
+            return 0.0
+        return remaining
+
+    def note_flood(self, chat_id: Any, retry_after: Optional[float] = None) -> float:
+        """Feed a 429 back in as a chat-wide cooldown; returns its length."""
+        key = str(chat_id)
+        try:
+            wait = float(retry_after) if retry_after is not None else 1.0
+        except (TypeError, ValueError):
+            wait = 1.0
+        if wait != wait or wait < 0.0:  # NaN / negative
+            wait = 1.0
+        wait = min(wait, 60.0)
+        now = self._clock()
+        self._cooldown_until[key] = max(self._cooldown_until.get(key, 0.0), now + wait)
+        self._tokens[key] = 0.0
+        self._updated[key] = now
+        return wait
+
+    def _reserve(self, chat_id: Any) -> float:
+        """Take one token, or return seconds until one is available."""
+        key = str(chat_id)
+        cooldown = self.cooldown_remaining(key)
+        if cooldown > 0.0:
+            # Do not bank allowance while the chat is held: the cooldown means
+            # "stop calling", so the bucket must not come back full.
+            self._updated[key] = self._clock()
+            return cooldown
+        now = self._clock()
+        tokens = self._tokens.get(key)
+        if tokens is None:
+            tokens = float(self.burst)
+            self._updated[key] = now
+        else:
+            elapsed = now - self._updated.get(key, now)
+            if elapsed > 0.0:
+                tokens = min(float(self.burst), tokens + elapsed / self.interval)
+                self._updated[key] = now
+        if tokens >= 1.0:
+            self._tokens[key] = tokens - 1.0
+            return 0.0
+        self._tokens[key] = tokens
+        return max(0.001, (1.0 - tokens) * self.interval)
+
+    async def acquire(self, chat_id: Any, max_wait: float = 30.0) -> float:
+        """Wait for a token; returns seconds spent waiting.
+
+        Fails open after ``max_wait`` so a pathological rate limit can never
+        wedge delivery — the caller proceeds and, if the platform still
+        disagrees, the existing 429 handling takes over.
+        """
+        started = self._clock()
+        while True:
+            wait = self._reserve(chat_id)
+            if wait <= 0.0:
+                return self._clock() - started
+            waited = self._clock() - started
+            if waited >= max_wait:
+                logger.debug(
+                    "Per-chat send budget exhausted for %.1fs on chat %s — "
+                    "proceeding (fail-open)",
+                    waited,
+                    chat_id,
+                )
+                return waited
+            await self._sleep(min(wait, max_wait - waited, 5.0))
+
+
+_CHAT_SEND_BUDGET = ChatSendBudget()
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -347,6 +540,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    SCHEDULED_TEXT_THRESHOLD = 3800
+    SCHEDULED_MAX_BYTES = 10 * 1024 * 1024
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
@@ -434,6 +629,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
+        # Shared per-chat send/edit budget.  Telegram's flood limiter is per
+        # CHAT while the gateway paces per stream, so concurrent streams into
+        # one chat overspend that chat's budget and get throttled (#30).  The
+        # bucket is process-wide; the rate is tunable per platform config or
+        # TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN without touching code.
+        self._chat_send_budget = _CHAT_SEND_BUDGET
+        self._chat_send_budget.configure(
+            self._chat_budget_per_minute(),
+            getattr(self.config, "telegram_chat_budget_burst", None),
+        )
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
@@ -463,6 +668,14 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # Polling stall watchdog — see _stall_watchdog_loop.  The getUpdates
+        # long-poll can wedge silently for many minutes (blackholed TCP
+        # connection / half-closed pool slot) WITHOUT firing error_callback,
+        # so neither the reconnect ladder nor the post-reconnect heartbeat
+        # probe run.  Tracks the monotonic time of the last COMPLETED
+        # getUpdates call; _install_poll_liveness_hook() keeps it fresh.
+        self._last_poll_completed_at: float = 0.0
+        self._stall_watchdog_task: Optional[asyncio.Task] = None
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -1433,7 +1646,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, exc_info=True,
             )
 
-    async def _handle_polling_network_error(self, error: Exception) -> None:
+    async def _handle_polling_network_error(
+        self, error: Exception, *, degrade_send_path: bool = True,
+    ) -> None:
         """Reconnect polling after a transient network interruption.
 
         Triggered by NetworkError/TimedOut in the polling error callback, which
@@ -1453,7 +1668,11 @@ class TelegramAdapter(BasePlatformAdapter):
         MAX_DELAY = 60
 
         self._polling_network_error_count += 1
-        self._send_path_degraded = True
+        # getUpdates and sendMessage are different endpoints: a polling fault
+        # does not prove the SEND path is broken.  A stall-watchdog trip is an
+        # inference, so it must not suppress sends (degrade_send_path=False).
+        if degrade_send_path:
+            self._send_path_degraded = True
         attempt = self._polling_network_error_count
 
         if attempt > MAX_NETWORK_RETRIES:
@@ -1492,6 +1711,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, attempt,
             )
             self._polling_network_error_count = 0
+            self._ensure_stall_watchdog()
             # start_polling() returning is necessary but not sufficient:
             # PTB's Updater can be left in a state where `running` is True
             # but the underlying long-poll task is wedged on a stale httpx
@@ -1559,6 +1779,139 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             await self._handle_polling_network_error(probe_err)
 
+    # ── Polling stall watchdog ──────────────────────────────────────────
+    #
+    # Observed 2026-09-25/27/28: the getUpdates long-poll stalled for 2-28
+    # minutes with NO error_callback and NO log line — only the absence of
+    # completed calls.  _install_poll_liveness_hook() timestamps every
+    # completed call; _stall_watchdog_loop() converts staleness beyond
+    # POLL_STALL_THRESHOLD into a re-entry of the existing reconnect ladder
+    # (_handle_polling_network_error), which drains the polling pool and
+    # restarts polling.
+    POLL_STALL_CHECK_INTERVAL = 30   # seconds between liveness evaluations
+    POLL_STALL_THRESHOLD = 90        # stale window that counts as wedged
+
+    def _install_poll_liveness_hook(self) -> None:
+        """Timestamp every COMPLETED getUpdates call on the Bot instance.
+
+        PTB resolves ``self.bot.get_updates`` on every polling iteration
+        (telegram.ext.Updater._start_polling → polling_action_cb), so a
+        class-level patch is enough — including across stop()/start_polling()
+        reconnect cycles.  Only successful completions stamp: a hung call must
+        leave the timestamp stale.
+        """
+        app = self._app
+        if not (app and getattr(app, "bot", None)):
+            return
+        bot = app.bot
+        # PTB's Bot refuses instance-attribute shadowing of get_updates
+        # (AttributeError: "Attribute `get_updates` of class `Bot` can't be
+        # set!").  The original instance-level patch therefore ALWAYS failed,
+        # and because it was logged at DEBUG the stall watchdog silently lost
+        # its liveness signal — so `_last_poll_completed_at` was only ever set
+        # when the watchdog re-armed, and the watchdog fired every threshold
+        # forever.  Patch the CLASS instead: the guard binds the instance
+        # attribute, not the class attribute.
+        cls = type(bot)
+        if getattr(cls, "_hermes_poll_liveness_hooked", False):
+            return
+        original = cls.get_updates
+        adapter = self
+
+        async def _hooked_get_updates(bot_self, *args, **kwargs):
+            result = await original(bot_self, *args, **kwargs)
+            adapter._last_poll_completed_at = time.monotonic()
+            return result
+
+        try:
+            cls.get_updates = _hooked_get_updates
+            cls._hermes_poll_liveness_hooked = True
+        except Exception:
+            # A dead liveness signal makes the watchdog fire unconditionally,
+            # so this must be visible, not DEBUG.
+            logger.warning(
+                "[%s] Could not install poll liveness hook", self.name,
+                exc_info=True,
+            )
+
+    def _ensure_stall_watchdog(self) -> None:
+        """Arm the polling stall watchdog (idempotent) and refresh the stamp.
+
+        Called whenever polling (re)starts, so the liveness clock starts
+        clean after every reconnect/conflict-recovery cycle.
+        """
+        self._last_poll_completed_at = time.monotonic()
+        if self._stall_watchdog_task and not self._stall_watchdog_task.done():
+            return
+        try:
+            task = asyncio.ensure_future(self._stall_watchdog_loop())
+        except RuntimeError:
+            return  # no running event loop
+        self._stall_watchdog_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        logger.info(
+            "[%s] Polling stall watchdog armed (threshold %ds, check %ds)",
+            self.name, self.POLL_STALL_THRESHOLD, self.POLL_STALL_CHECK_INTERVAL,
+        )
+
+    async def _stall_watchdog_loop(self) -> None:
+        """Force reconnect when getUpdates stops completing (silent wedge).
+
+        Guards against false positives / duplicate recovery:
+        - only evaluates while the updater claims ``running``;
+        - skips while a reconnect/conflict ladder is already in flight
+          (counters > 0, or an error-callback task is pending);
+        - resets the liveness stamp before each recovery attempt so a slow
+          reconnect cannot immediately re-trigger.
+        """
+        while not self.has_fatal_error:
+            await asyncio.sleep(self.POLL_STALL_CHECK_INTERVAL)
+            if self.has_fatal_error:
+                return
+            app = self._app
+            if not (app and app.updater and app.updater.running):
+                continue
+            if self._polling_network_error_count or self._polling_conflict_count:
+                continue
+            if self._polling_error_task and not self._polling_error_task.done():
+                continue
+            last = self._last_poll_completed_at
+            if not last:
+                continue
+            age = time.monotonic() - last
+            if age < self.POLL_STALL_THRESHOLD:
+                continue
+            logger.warning(
+                "[%s] Polling stall detected — no completed getUpdates in "
+                "%.0fs; forcing reconnect",
+                self.name, age,
+            )
+            self._last_poll_completed_at = time.monotonic()
+            try:
+                recovery = asyncio.ensure_future(
+                    self._handle_polling_network_error(
+                        TimeoutError(
+                            "getUpdates made no progress for %.0fs (stall watchdog)" % age
+                        ),
+                        # Watchdog inference, not an observed send failure:
+                        # never suppress the send path on this signal.
+                        degrade_send_path=False,
+                    )
+                )
+                # Mirror the error-callback pattern so a concurrent
+                # error_callback sees "recovery in flight" and does not
+                # stack a second stop/start cycle on top of ours.
+                self._polling_error_task = recovery
+                self._background_tasks.add(recovery)
+                recovery.add_done_callback(self._background_tasks.discard)
+                await recovery
+            except Exception:
+                logger.debug(
+                    "[%s] Stall watchdog recovery attempt errored", self.name,
+                    exc_info=True,
+                )
+
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
@@ -1619,6 +1972,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 )
                 self._polling_conflict_count = 0  # reset counter on success
+                self._ensure_stall_watchdog()
                 return
             except Exception as retry_err:
                 logger.warning(
@@ -2097,6 +2451,9 @@ class TelegramAdapter(BasePlatformAdapter):
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
+            # Timestamp completed getUpdates calls before the first
+            # start_polling() so the stall watchdog has a live signal to read.
+            self._install_poll_liveness_hook()
             
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
@@ -2216,6 +2573,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=_polling_error_callback,
                 )
+                self._ensure_stall_watchdog()
             
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
@@ -2383,6 +2741,66 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    # ── Per-chat send budget ─────────────────────────────────────────────
+    def _chat_budget_per_minute(self) -> int:
+        """Sustained outbound calls/minute allowed for a single chat.
+
+        Precedence: ``TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN`` env var, then the
+        platform config field, then the built-in default of 20 (one call per
+        3 s with a burst of 3).
+        """
+        candidates: List[Any] = [
+            os.getenv("TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN"),
+            getattr(self.config, "telegram_max_edits_per_chat_per_min", None),
+        ]
+        for candidate in candidates:
+            if candidate is None or candidate == "":
+                continue
+            try:
+                return max(1, int(candidate))
+            except (TypeError, ValueError):
+                continue
+        return DEFAULT_TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN
+
+    async def _spend_chat_send_budget(self, chat_id: str) -> None:
+        """Take this chat's shared send token before hitting the Bot API."""
+        budget = getattr(self, "_chat_send_budget", None)
+        if budget is None:
+            return
+        waited = await budget.acquire(chat_id)
+        if waited >= 0.25:
+            logger.debug(
+                "[%s] per-chat send budget: waited %.2fs for chat %s",
+                self.name,
+                waited,
+                chat_id,
+            )
+
+    def _note_chat_flood(self, chat_id: str, retry_after: Any = None) -> None:
+        """Record a 429 as a chat-wide cooldown, not just a per-call sleep."""
+        budget = getattr(self, "_chat_send_budget", None)
+        if budget is None:
+            return
+        wait = budget.note_flood(chat_id, retry_after)
+        logger.debug(
+            "[%s] per-chat cooldown %.1fs set for chat %s after flood control",
+            self.name,
+            wait,
+            chat_id,
+        )
+
+    def chat_cooldown_remaining(self, chat_id: str) -> float:
+        """Seconds this chat is held by a platform-imposed 429 cooldown.
+
+        Stream consumers consult this before editing: while the chat is in
+        cooldown they skip intermediate edits (final-only) instead of spending
+        the chat's budget on retries and downgrading formatting.
+        """
+        budget = getattr(self, "_chat_send_budget", None)
+        if budget is None:
+            return 0.0
+        return budget.cooldown_remaining(chat_id)
+
     async def send(
         self,
         chat_id: str,
@@ -2401,7 +2819,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        # Shared per-chat budget: hold here rather than letting the platform
+        # throttle us (and every other stream into this chat) afterwards.
+        await self._spend_chat_send_budget(chat_id)
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
@@ -2620,6 +3042,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            # Telegram's 429 applies to the whole chat: record
+                            # the cooldown so concurrent streams stop spending
+                            # this chat's budget too, not just this caller.
+                            self._note_chat_flood(chat_id, retry_after)
                             if _send_attempt < 2:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 logger.warning(
@@ -2676,6 +3102,125 @@ class TelegramAdapter(BasePlatformAdapter):
             is_pool_timeout = self._looks_like_pool_timeout(e)
             return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or is_pool_timeout or not is_timeout))
 
+    @staticmethod
+    def _scheduled_output_filename(run_id: str) -> str:
+        safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id or "run"))
+        safe_run_id = safe_run_id.strip(".-")[:96] or "run"
+        return f"scheduled-output-{safe_run_id}.md"
+
+    @staticmethod
+    def _scheduled_output_caption(job_name: str, run_id: str) -> str:
+        plain_name = re.sub(r"[\r\n]+", " ", str(job_name or "cron job")).strip()
+        short_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id or "run"))[:16] or "run"
+        caption = f"{plain_name} — full scheduled output attached (run {short_id})"
+        return caption[:512]
+
+    async def send_scheduled_output(
+        self,
+        text: str,
+        *,
+        destination: str,
+        run_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        job_name: str = "cron job",
+    ) -> SendResult:
+        """Send scheduled output without ever chunking an oversized result.
+
+        Scheduled output has a deliberately separate policy from interactive
+        replies: a result over the safe text threshold is uploaded once as a
+        UTF-8 Markdown document with a plain caption.  The document path is
+        temporary and is removed regardless of the platform response.
+        """
+        if utf16_len(text) <= self.SCHEDULED_TEXT_THRESHOLD:
+            result = await self.send(destination, text, metadata=metadata)
+            if result and result.success and result.message_id:
+                payload_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "delivery_kind": "text",
+                    "payload_sha256": payload_sha256,
+                    "run_id": str(run_id),
+                }
+                return DeliveryReceipt(
+                    success=True,
+                    message_id=result.message_id,
+                    raw_response=result.raw_response,
+                    retryable=result.retryable,
+                    retry_after=result.retry_after,
+                    run_id=str(run_id),
+                    payload_sha256=payload_sha256,
+                    delivery_kind="text",
+                    delivered_at=datetime.now(timezone.utc).isoformat(),
+                )
+            return result
+
+        payload = text.encode("utf-8")
+        if len(payload) > self.SCHEDULED_MAX_BYTES:
+            return SendResult(
+                success=False,
+                error=(
+                    "scheduled output exceeds Telegram's 10 MiB safety ceiling "
+                    f"({len(payload)} bytes)"
+                ),
+                retryable=False,
+            )
+
+        filename = self._scheduled_output_filename(run_id)
+        caption = self._scheduled_output_caption(job_name, run_id)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".scheduled-output-",
+                suffix=".md",
+                delete=False,
+            ) as output_file:
+                temp_path = output_file.name
+                output_file.write(payload)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+
+            result = await self.send_document(
+                chat_id=destination,
+                file_path=temp_path,
+                caption=caption,
+                file_name=filename,
+                metadata=metadata,
+                scheduled=True,
+            )
+            if result and result.success and result.message_id:
+                payload_sha256 = hashlib.sha256(payload).hexdigest()
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "delivery_kind": "document",
+                    "payload_sha256": payload_sha256,
+                    "run_id": str(run_id),
+                    "filename": filename,
+                    "caption": caption,
+                }
+                return DeliveryReceipt(
+                    success=True,
+                    message_id=result.message_id,
+                    raw_response=result.raw_response,
+                    retryable=result.retryable,
+                    retry_after=result.retry_after,
+                    run_id=str(run_id),
+                    payload_sha256=payload_sha256,
+                    delivery_kind="document",
+                    delivered_at=datetime.now(timezone.utc).isoformat(),
+                )
+            return result
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    logger.warning(
+                        "[%s] Failed to remove temporary scheduled output %s",
+                        self.name,
+                        temp_path,
+                    )
+
     async def send_or_update_status(
         self,
         chat_id: str,
@@ -2731,6 +3276,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        # Shared per-chat budget (Telegram throttles per CHAT, not per stream).
+        await self._spend_chat_send_budget(chat_id)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -2814,6 +3362,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Telegram flood control, waiting %.1fs",
                     self.name, wait,
                 )
+                # Chat-wide cooldown: other streams into this chat must back off
+                # too, otherwise they immediately re-throttle it.
+                self._note_chat_flood(chat_id, wait)
                 if wait > 5.0:
                     return SendResult(success=False, error=f"flood_control:{wait}")
                 await asyncio.sleep(wait)
@@ -4775,6 +5326,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        scheduled = bool(kwargs.pop("scheduled", False))
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
@@ -4810,6 +5362,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] Failed to send document: %s", self.name, e, exc_info=True)
+            if scheduled:
+                # A scheduled oversize payload must not fall back to the base
+                # adapter, whose text rendering would re-enter chunking.
+                return SendResult(success=False, error=str(e), retryable=False)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_video(

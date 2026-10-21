@@ -164,6 +164,12 @@ class GatewayStreamConsumer:
         # is intentional content, not a stale preview to delete.
         self._fallback_preserve_partial_messages = False
         self._flood_strikes = 0         # Consecutive flood-control edit failures
+        # Set when an intermediate edit was skipped because the whole chat is
+        # in a platform-imposed 429 cooldown (Telegram throttles per chat, not
+        # per stream).  Distinct from a hard edit failure: edits are still
+        # supported, so the flag is cleared as soon as an edit succeeds again.
+        self._cooldown_fallback = False
+        self._cooldown_skipped_edits = 0
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
         # Set when the final response content was sent to the user via
@@ -300,6 +306,7 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
+        self._cooldown_fallback = False
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
         # can't fool the gateway. Safe: got_done returns before any reset, and
@@ -820,6 +827,27 @@ class GatewayStreamConsumer:
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
             prefix = prefix[:-len(self.cfg.cursor)]
         return self._clean_for_display(prefix)
+
+    def _chat_cooldown_remaining(self) -> float:
+        """Seconds of adapter-imposed chat-wide 429 cooldown left (0.0 if none).
+
+        Telegram flood control is enforced per CHAT while this consumer paces
+        per stream, so the adapter exposes the shared cooldown here.  Adapters
+        without the probe (or MagicMock stand-ins in tests) read as clear.
+        """
+        probe = getattr(self.adapter, "chat_cooldown_remaining", None)
+        if not callable(probe):
+            return 0.0
+        try:
+            value = probe(self.chat_id)
+        except Exception:
+            return 0.0
+        # Only a real number counts.  MagicMock stand-ins in tests answer every
+        # attribute and convert to float, which would read as "chat cooling
+        # down" and silently disable intermediate edits.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        return max(0.0, float(value))
 
     def _continuation_text(self, final_text: str) -> str:
         """Return only the part of final_text the user has not already seen."""
@@ -1391,6 +1419,27 @@ class GatewayStreamConsumer:
         try:
             if self._message_id is not None:
                 if self._edit_supported:
+                    # Chat-wide 429 cooldown: Telegram's flood limiter is per
+                    # CHAT, so one throttled chat throttles every stream writing
+                    # into it.  Skip the intermediate edit (final-only) instead
+                    # of burning the chat's budget and downgrading parse_mode —
+                    # formatting survives because we stop editing rather than
+                    # drop MarkdownV2.  The final content still reaches the user
+                    # via the fallback send, and edits resume automatically if
+                    # the cooldown clears before the turn ends.
+                    if not finalize and self._chat_cooldown_remaining() > 0.0:
+                        if not self._fallback_final_send:
+                            self._fallback_prefix = self._visible_prefix()
+                            self._already_sent = True
+                            self._cooldown_fallback = True
+                            logger.debug(
+                                "Chat %s in flood cooldown — skipping "
+                                "intermediate edit (final-only)",
+                                self.chat_id,
+                            )
+                        self._fallback_final_send = True
+                        self._cooldown_skipped_edits += 1
+                        return False
                     # Skip if text is identical to what we last sent.
                     # Exception: adapters that require an explicit finalize
                     # call (REQUIRES_EDIT_FINALIZE) must still receive the
@@ -1464,8 +1513,14 @@ class GatewayStreamConsumer:
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
-                        # Successful edit — reset flood strike counter
+                        # Successful edit — reset flood strike counter and any
+                        # cooldown-induced final-only fallback: we are editing
+                        # again, so keeping it would duplicate visible text.
                         self._flood_strikes = 0
+                        if self._cooldown_fallback:
+                            self._cooldown_fallback = False
+                            self._fallback_final_send = False
+                            self._fallback_prefix = ""
                         return True
                     else:
                         if (

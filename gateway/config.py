@@ -336,6 +336,16 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Sustained outbound message/edit budget for one TELEGRAM chat, in calls
+    # per minute.  Telegram's flood limiter is enforced per chat, but each
+    # gateway stream keeps its own edit timer, so concurrent streams into one
+    # chat overspend that chat's budget and get throttled.  The Telegram
+    # adapter enforces one shared per-chat token bucket
+    # (gateway.platforms.telegram.ChatSendBudget) at this rate: 20 = one call
+    # per 3 s with an initial burst of 3.  Tunable here, in the `telegram:`
+    # config block, or via TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN — no code change.
+    telegram_max_edits_per_chat_per_min: int = 20
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -368,6 +378,10 @@ class PlatformConfig:
         if _grn is None:
             _grn = data.get("extra", {}).get("gateway_restart_notification")
 
+        _chat_budget = data.get("telegram_max_edits_per_chat_per_min")
+        if _chat_budget is None:
+            _chat_budget = data.get("extra", {}).get("max_edits_per_chat_per_min")
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -375,6 +389,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            telegram_max_edits_per_chat_per_min=_coerce_int(_chat_budget, 20),
             extra=data.get("extra", {}),
         )
 
@@ -1114,6 +1129,16 @@ def load_gateway_config() -> GatewayConfig:
                     _tg_extra.setdefault(
                         "disable_topic_auto_rename",
                         telegram_cfg["disable_topic_auto_rename"],
+                    )
+                # Per-chat outbound budget (calls/minute). Bridged to env so the
+                # Telegram adapter picks it up without a code change; the
+                # per-platform config field still works on its own.
+                if (
+                    "max_edits_per_chat_per_min" in telegram_cfg
+                    and not os.getenv("TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN")
+                ):
+                    os.environ["TELEGRAM_MAX_EDITS_PER_CHAT_PER_MIN"] = str(
+                        telegram_cfg["max_edits_per_chat_per_min"]
                     )
                 # Prefer telegram.require_mention; fall back to the top-level shorthand.
                 _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
