@@ -713,6 +713,73 @@ class TestTelegramExtSuppression:
         assert "telegram.ext" in hermes_logging._NOISY_LOGGERS
 
 
+class TestSlackSdkSuppression:
+    """slack_bolt / slack_sdk DEBUG chatter is suppressed at WARNING.
+
+    Regression for system-review#74: Bolt's Socket Mode handshake and the
+    SDK's WebClient request/rate-limit DEBUG lines are pure library noise.
+    Both setup_logging() and setup_verbose_logging() raise the two package
+    roots to WARNING via ``_NOISY_LOGGERS``, while WARNING/ERROR records stay
+    visible and unrelated logger policy (telegram.ext, gateway loggers) is
+    untouched.
+    """
+
+    _SLACK_ROOTS = ("slack_bolt", "slack_sdk")
+
+    @staticmethod
+    def _reset_slack():
+        # The module stores logger objects in the global registry and the
+        # autouse fixture only resets the init sentinel + root handlers, so
+        # clear the level here to prove the *entry point* sets it.
+        for name in TestSlackSdkSuppression._SLACK_ROOTS:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+    def test_setup_logging_raises_slack_roots(self, hermes_home):
+        self._reset_slack()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        for name in self._SLACK_ROOTS:
+            assert logging.getLogger(name).level == logging.WARNING
+
+    def test_setup_verbose_logging_raises_slack_roots(self, hermes_home):
+        self._reset_slack()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.setup_verbose_logging()
+        for name in self._SLACK_ROOTS:
+            assert logging.getLogger(name).level == logging.WARNING
+
+    def test_descendants_inherit_warning(self, hermes_home):
+        self._reset_slack()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        for name in ("slack_bolt.App", "slack_sdk.web.WebClient"):
+            assert (
+                logging.getLogger(name).getEffectiveLevel() == logging.WARNING
+            )
+
+    def test_debug_suppressed_warning_and_error_kept(self, hermes_home):
+        self._reset_slack()
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        app_logger = logging.getLogger("slack_bolt.App")
+        assert not app_logger.isEnabledFor(logging.DEBUG)
+        assert not app_logger.isEnabledFor(logging.INFO)
+        assert app_logger.isEnabledFor(logging.WARNING)
+        assert app_logger.isEnabledFor(logging.ERROR)
+
+    def test_only_the_two_slack_roots_added(self):
+        slack_entries = {
+            name for name in hermes_logging._NOISY_LOGGERS
+            if name.split(".")[0] in self._SLACK_ROOTS
+        }
+        assert slack_entries == set(self._SLACK_ROOTS)
+
+    def test_telegram_and_gateway_policy_preserved(self, hermes_home):
+        gateway_logger = logging.getLogger("gateway.platforms.slack")
+        before = gateway_logger.level
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert "telegram.ext" in hermes_logging._NOISY_LOGGERS
+        assert "telegram.request" not in hermes_logging._NOISY_LOGGERS
+        assert gateway_logger.level == before
+
+
 class TestAddRotatingHandler:
     """_add_rotating_handler() is idempotent and creates the directory."""
 

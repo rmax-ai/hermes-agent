@@ -136,6 +136,14 @@ _NOISY_LOGGERS = (
     # records.  Scoped to telegram.ext (and descendants via normal logger
     # inheritance) so telegram.request / gateway telemetry stay visible.
     "telegram.ext",
+    # Slack Bolt / SDK transport chatter (slack_bolt.*, slack_sdk.*) is the
+    # same class of pure-library DEBUG — Socket Mode handshake, WebClient
+    # request/response and rate-limit retry lines — with no Hermes semantics.
+    # Scoped to the two package roots (descendants inherit) so WARNING/ERROR
+    # records from those libraries and Hermes' own gateway loggers stay
+    # visible.
+    "slack_bolt",
+    "slack_sdk",
 )
 
 
