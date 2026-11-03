@@ -28,6 +28,7 @@ Usage:
 import os
 import re
 import difflib
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -234,6 +235,57 @@ class SearchMatch:
 
 
 @dataclass
+class SearchScope:
+    """Internal scope and completeness metadata for content searches."""
+    backend: str
+    normalized_root: str
+    explicit_hidden_root: bool = False
+    explicit_file: bool = False
+    skipped_nested_hidden: int = 0
+    skipped_gitignored: int = 0
+    incomplete_reason: Optional[str] = None
+    git_worktree_root: Optional[str] = field(default=None, repr=False)
+    search_cwd: str = field(default="", repr=False)
+    ignore_accounting_unavailable: bool = field(default=False, repr=False)
+
+    def mark_incomplete(self, reason: str) -> None:
+        if not reason:
+            return
+        reason = " ".join(str(reason).split())
+        if self.incomplete_reason is None:
+            self.incomplete_reason = reason
+        elif reason not in self.incomplete_reason:
+            self.incomplete_reason = f"{self.incomplete_reason}; {reason}"
+
+    @property
+    def footer(self) -> str:
+        """Render a concise diagnostic only when search scope was affected."""
+        if not (
+            self.skipped_nested_hidden
+            or self.skipped_gitignored
+            or self.incomplete_reason
+        ):
+            return ""
+
+        parts = []
+        if self.explicit_hidden_root:
+            parts.append("Searched explicit hidden root")
+
+        skipped = []
+        if self.skipped_nested_hidden:
+            skipped.append(f"{self.skipped_nested_hidden} nested-hidden")
+        if self.skipped_gitignored:
+            skipped.append(f"{self.skipped_gitignored} gitignored")
+        if skipped:
+            parts.append("skipped " + " and ".join(skipped) + " paths")
+        if self.incomplete_reason:
+            parts.append(
+                f"search completeness uncertain: {self.incomplete_reason}"
+            )
+        return "; ".join(parts) + "."
+
+
+@dataclass
 class SearchResult:
     """Result from searching."""
     matches: List[SearchMatch] = field(default_factory=list)
@@ -243,6 +295,7 @@ class SearchResult:
     truncated: bool = False
     limit_reason: Optional[str] = None
     error: Optional[str] = None
+    scope: Optional[SearchScope] = None
     
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
@@ -304,7 +357,17 @@ class SearchResult:
             result["limit_reason"] = self.limit_reason
         if self.error:
             result["error"] = self.error
+        if self.scope and self.scope.footer:
+            result["scope_footer"] = self.scope.footer
         return result
+
+
+def _has_hidden_path_ancestor(path: str | Path) -> bool:
+    """Match the file-name search rule for explicitly selected hidden roots."""
+    return any(
+        part not in {".", ".."} and part.startswith(".")
+        for part in Path(path).parts
+    )
 
 
 @dataclass
@@ -332,12 +395,21 @@ class ExecuteResult:
 
 
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
+_SEARCH_OUTPUT_TRUNCATION_RE = re.compile(
+    r"\n*\.\.\. \[OUTPUT TRUNCATED - \d+ chars omitted "
+    r"out of \d+ total\] \.\.\.\n*"
+)
 
 
 def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]:
     """Return stdout cleaned for parsing and a limit reason for search timeouts."""
     if result.exit_code == 124:
         return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
+    if _SEARCH_OUTPUT_TRUNCATION_RE.search(result.stdout):
+        return (
+            _SEARCH_OUTPUT_TRUNCATION_RE.sub("\n", result.stdout),
+            "search_output_truncated",
+        )
     return result.stdout, None
 
 
@@ -1942,7 +2014,12 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         
         # Validate that the path exists before searching
-        check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
+        check = self._exec(
+            f"if test -d {self._escape_shell_arg(path)}; then echo directory; "
+            f"elif test -f {self._escape_shell_arg(path)}; then echo file; "
+            f"elif test -e {self._escape_shell_arg(path)}; then echo other; "
+            "else echo not_found; fi"
+        )
         if "not_found" in check.stdout:
             # Try to suggest nearby paths
             parent = os.path.dirname(path) or "."
@@ -1969,16 +2046,45 @@ class ShellFileOperations(FileOperations):
                         hint_parts.append(
                             "Similar paths: " + ", ".join(candidates[:5])
                         )
+            scope = None
+            if target != "files":
+                scope = SearchScope(
+                    backend="unavailable",
+                    normalized_root=self._normalized_search_root(path),
+                    explicit_hidden_root=_has_hidden_path_ancestor(path),
+                    explicit_file=False,
+                    incomplete_reason="search root was not found",
+                )
             return SearchResult(
                 error=". ".join(hint_parts),
-                total_count=0
+                total_count=0,
+                scope=scope,
+            )
+        if check.exit_code != 0:
+            scope = None
+            if target != "files":
+                scope = SearchScope(
+                    backend="unavailable",
+                    normalized_root=self._normalized_search_root(path),
+                    explicit_hidden_root=_has_hidden_path_ancestor(path),
+                    incomplete_reason="search root validation failed",
+                )
+            detail = (check.stdout or "").strip() or "path validation command failed"
+            return SearchResult(
+                error=f"Could not validate search path: {detail}",
+                scope=scope,
             )
         
         if target == "files":
             return self._search_files(pattern, path, limit, offset)
         else:
+            path_details = check.stdout.strip().splitlines()
+            path_kind = path_details[-1].strip() if path_details else "directory"
+            if path_kind not in {"directory", "file", "other"}:
+                # Older/mock terminal adapters may only report "exists".
+                path_kind = "directory"
             return self._search_content(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+                                        output_mode, context, path_kind)
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
@@ -1989,10 +2095,7 @@ class ShellFileOperations(FileOperations):
             search_pattern = pattern.split('/')[-1]
 
         search_root = Path(path)
-        has_hidden_path_ancestor = any(
-            part not in {".", ".."} and part.startswith(".")
-            for part in search_root.parts
-        )
+        has_hidden_path_ancestor = _has_hidden_path_ancestor(path)
 
         # Prefer ripgrep: respects .gitignore, excludes hidden dirs by
         # default, and has parallel directory traversal (~200x faster than
@@ -2112,158 +2215,459 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
     
+    def _normalized_search_root(self, path: str) -> str:
+        """Return an absolute, normalized path using the terminal's live cwd."""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            cwd = getattr(self.env, "cwd", None) or self.cwd or os.getcwd()
+            candidate = Path(cwd) / candidate
+        return os.path.abspath(os.path.normpath(str(candidate)))
+
+    def _content_search_scope(
+        self, path: str, path_kind: str, backend: str
+    ) -> SearchScope:
+        """Build shared backend policy and identify a local Git worktree."""
+        normalized_root = self._normalized_search_root(path)
+        explicit_file = path_kind == "file"
+        search_cwd = (
+            getattr(self.env, "cwd", None) or self.cwd or os.getcwd()
+        )
+        scope = SearchScope(
+            backend=backend,
+            normalized_root=normalized_root,
+            explicit_hidden_root=(
+                not explicit_file and _has_hidden_path_ancestor(path)
+            ),
+            explicit_file=explicit_file,
+            search_cwd=os.path.normpath(search_cwd),
+        )
+
+        # Explicit files are the target themselves, even when hidden or
+        # gitignored. Git ignore accounting applies only while walking a root.
+        if explicit_file:
+            return scope
+
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=normalized_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, FileNotFoundError) and not os.path.isdir(
+                normalized_root
+            ):
+                scope.mark_incomplete(
+                    "search root is unavailable for Git ignore accounting"
+                )
+                return scope
+            scope.ignore_accounting_unavailable = True
+            scope.mark_incomplete(
+                f"Git ignore accounting unavailable ({type(exc).__name__})"
+            )
+            return scope
+
+        if result.returncode == 0:
+            scope.git_worktree_root = os.path.normpath(
+                result.stdout.decode("utf-8", "replace").strip()
+            )
+        else:
+            diagnostic = (result.stderr + result.stdout).decode(
+                "utf-8", "replace"
+            ).lower()
+            if "not a git repository" not in diagnostic:
+                scope.ignore_accounting_unavailable = True
+                scope.mark_incomplete(
+                    "Git ignore accounting unavailable (could not identify worktree)"
+                )
+        return scope
+
+    def _filter_content_candidates(
+        self, candidates: list[str], scope: SearchScope
+    ) -> tuple[list[str], Optional[str]]:
+        """Apply hidden-descendant and Git ignore policy to candidate paths."""
+        if scope.explicit_file:
+            return candidates, None
+
+        normalized_paths: list[str] = []
+        by_absolute_path: dict[str, str] = {}
+        original_paths: dict[str, str] = {}
+        seen_paths: set[str] = set()
+        for candidate in candidates:
+            absolute_path = self._absolute_content_candidate(candidate, scope)
+            if absolute_path in seen_paths:
+                continue
+            seen_paths.add(absolute_path)
+            original_paths[absolute_path] = candidate
+            try:
+                relative_path = os.path.relpath(
+                    absolute_path, scope.normalized_root
+                )
+            except ValueError:
+                scope.mark_incomplete("backend returned a path outside the search root")
+                continue
+            relative_parts = Path(relative_path).parts
+            if relative_path == os.pardir or relative_path.startswith(
+                os.pardir + os.sep
+            ):
+                scope.mark_incomplete("backend returned a path outside the search root")
+                continue
+            if any(
+                part not in {".", ".."} and part.startswith(".")
+                for part in relative_parts
+            ):
+                scope.skipped_nested_hidden += 1
+                continue
+            normalized_paths.append(absolute_path)
+            if scope.git_worktree_root:
+                try:
+                    git_relative_path = os.path.relpath(
+                        absolute_path, scope.git_worktree_root
+                    )
+                except ValueError:
+                    scope.mark_incomplete(
+                        "Git ignore accounting could not relativize a candidate"
+                    )
+                    return [], "Search failed: Git ignore accounting is unavailable"
+                if git_relative_path == os.pardir or git_relative_path.startswith(
+                    os.pardir + os.sep
+                ):
+                    scope.mark_incomplete(
+                        "Git ignore accounting found a candidate outside the worktree"
+                    )
+                    return [], "Search failed: Git ignore accounting is unavailable"
+                by_absolute_path[absolute_path] = git_relative_path.replace(
+                    os.sep, "/"
+                )
+
+        if scope.ignore_accounting_unavailable:
+            if normalized_paths:
+                return [], "Search failed: Git ignore accounting is unavailable"
+            return [], None
+        if not scope.git_worktree_root or not normalized_paths:
+            return [original_paths[path] for path in normalized_paths], None
+
+        ignore_input = b"".join(
+            by_absolute_path[path].encode("utf-8", "surrogateescape") + b"\0"
+            for path in normalized_paths
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    scope.git_worktree_root,
+                    "check-ignore",
+                    "--stdin",
+                    "-z",
+                ],
+                input=ignore_input,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            scope.ignore_accounting_unavailable = True
+            scope.mark_incomplete(
+                f"Git ignore accounting failed ({type(exc).__name__})"
+            )
+            return [], "Search failed: Git ignore accounting is unavailable"
+
+        if result.returncode not in {0, 1}:
+            diagnostic = result.stderr.decode("utf-8", "replace").strip()
+            scope.ignore_accounting_unavailable = True
+            scope.mark_incomplete(
+                "Git ignore accounting failed"
+                + (f": {diagnostic}" if diagnostic else "")
+            )
+            return [], "Search failed: Git ignore accounting is unavailable"
+
+        ignored = {
+            item.decode("utf-8", "surrogateescape")
+            for item in result.stdout.split(b"\0")
+            if item
+        }
+        if not ignored:
+            return [original_paths[path] for path in normalized_paths], None
+
+        visible = []
+        for absolute_path in normalized_paths:
+            if by_absolute_path[absolute_path] in ignored:
+                scope.skipped_gitignored += 1
+            else:
+                visible.append(original_paths[absolute_path])
+        return visible, None
+
+    def _parse_content_search_payload(
+        self,
+        stdout: str,
+        output_mode: str,
+        limit: int,
+        offset: int,
+        context: int,
+        limit_reason: Optional[str],
+        scope: SearchScope,
+    ) -> SearchResult:
+        """Parse, scope-filter, and page one backend's content-search output."""
+        if output_mode == "files_only":
+            entries: list[Any] = [
+                entry for entry in stdout.strip().split("\n") if entry
+            ]
+            candidate_paths = [entry for entry in entries if isinstance(entry, str)]
+        elif output_mode == "count":
+            entries = {}
+            for line in stdout.strip().split("\n"):
+                if ":" not in line:
+                    continue
+                path, count = line.rsplit(":", 1)
+                try:
+                    entries[path] = int(count)
+                except ValueError:
+                    continue
+            candidate_paths = list(entries)
+        else:
+            match_re = re.compile(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$")
+            entries = []
+            for line in stdout.strip().split("\n"):
+                if not line or line == "--":
+                    continue
+                match = match_re.match(line)
+                if match:
+                    entries.append(
+                        SearchMatch(
+                            path=(match.group(1) or "") + match.group(2),
+                            line_number=int(match.group(3)),
+                            content=match.group(4)[:500],
+                        )
+                    )
+                    continue
+                if context > 0:
+                    parsed = _parse_search_context_line(line)
+                    if parsed:
+                        entries.append(
+                            SearchMatch(
+                                path=parsed[0],
+                                line_number=parsed[1],
+                                content=parsed[2][:500],
+                            )
+                        )
+            candidate_paths = [entry.path for entry in entries]
+
+        visible_paths, filter_error = self._filter_content_candidates(
+            candidate_paths, scope
+        )
+        if filter_error:
+            return SearchResult(error=filter_error, scope=scope)
+        visible_keys = {
+            self._absolute_content_candidate(candidate, scope)
+            for candidate in visible_paths
+        }
+
+        if output_mode == "files_only":
+            visible_entries = [
+                entry for entry in entries
+                if self._absolute_content_candidate(entry, scope) in visible_keys
+            ]
+            total = len(visible_entries)
+            return SearchResult(
+                files=visible_entries[offset:offset + limit],
+                total_count=total,
+                truncated=(
+                    total > offset + limit
+                    or bool(limit_reason)
+                    or bool(scope.incomplete_reason)
+                ),
+                limit_reason=limit_reason,
+                scope=scope,
+            )
+
+        if output_mode == "count":
+            visible_counts = {
+                path: count for path, count in entries.items()
+                if self._absolute_content_candidate(path, scope) in visible_keys
+            }
+            total = sum(visible_counts.values())
+            return SearchResult(
+                counts=visible_counts,
+                total_count=total,
+                truncated=bool(limit_reason or scope.incomplete_reason),
+                limit_reason=limit_reason,
+                scope=scope,
+            )
+
+        visible_matches = [
+            entry for entry in entries
+            if self._absolute_content_candidate(entry.path, scope) in visible_keys
+        ]
+        total = len(visible_matches)
+        return SearchResult(
+            matches=visible_matches[offset:offset + limit],
+            total_count=total,
+            truncated=(
+                total > offset + limit
+                or bool(limit_reason)
+                or bool(scope.incomplete_reason)
+            ),
+            limit_reason=limit_reason,
+            scope=scope,
+        )
+
+    @staticmethod
+    def _absolute_content_candidate(candidate: str, scope: SearchScope) -> str:
+        if os.path.isabs(candidate):
+            return os.path.normpath(candidate)
+        absolute_path = os.path.normpath(
+            os.path.join(scope.search_cwd, candidate)
+        )
+        try:
+            if os.path.commonpath(
+                [absolute_path, scope.normalized_root]
+            ) == scope.normalized_root:
+                return absolute_path
+            rooted_candidate = os.path.normpath(
+                os.path.join(scope.normalized_root, candidate)
+            )
+            if os.path.commonpath(
+                [rooted_candidate, scope.normalized_root]
+            ) == scope.normalized_root:
+                return rooted_candidate
+        except ValueError:
+            pass
+        return absolute_path
+
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+                        limit: int, offset: int, output_mode: str, context: int,
+                        path_kind: str = "directory") -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
         if self._has_command('rg'):
             return self._search_with_rg(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+                                        output_mode, context, path_kind)
         elif self._has_command('grep'):
             return self._search_with_grep(pattern, path, file_glob, limit, offset,
-                                          output_mode, context)
+                                          output_mode, context, path_kind)
         else:
             # Neither rg nor grep available (Windows without Git Bash, etc.)
+            scope = self._content_search_scope(path, path_kind, "unavailable")
+            scope.mark_incomplete("no content-search backend is available")
             return SearchResult(
                 error="Content search requires ripgrep (rg) or grep. "
-                      "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
+                      "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation",
+                scope=scope,
             )
     
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
-        """Search using ripgrep."""
+                        limit: int, offset: int, output_mode: str, context: int,
+                        path_kind: str = "directory") -> SearchResult:
+        """Search using ripgrep, then apply the shared root-scope policy."""
+        scope = self._content_search_scope(path, path_kind, "rg")
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
-        
-        # Add context if requested
+
+        # Read hidden candidates so the shared post-filter can enforce the
+        # same nested-hidden policy and diagnostics as grep.
+        if not scope.explicit_file or scope.explicit_hidden_root:
+            cmd_parts.append("--hidden")
+        # In a worktree, Git's batched predicate below is the source of VCS
+        # ignore behavior for both backends.
+        if scope.git_worktree_root and not scope.explicit_file:
+            cmd_parts.append("--no-ignore-vcs")
+
+        searching_git_metadata = self._search_root_is_git_metadata(scope)
+        if not scope.explicit_file and not searching_git_metadata:
+            cmd_parts.extend(["--glob", self._escape_shell_arg("!**/.git/**")])
+
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
-        
-        # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
-        
-        # Output mode handling
         if output_mode == "files_only":
-            cmd_parts.append("-l")  # Files only
+            cmd_parts.append("-l")
         elif output_mode == "count":
-            cmd_parts.append("-c")  # Count per file
-        
-        # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
-        
-        # Fetch extra rows so we can report the true total before slicing.
-        # For context mode, rg emits separator lines ("--") between groups,
-        # so we grab generously and filter in Python.
-        fetch_limit = limit + offset + 200 if context > 0 else limit + offset
+            cmd_parts.append("-c")
+
+        cmd_parts.extend([
+            self._escape_shell_arg(pattern),
+            self._escape_shell_arg(path),
+        ])
+
+        # Fetch beyond the requested page because hidden/ignored matches are
+        # filtered after both backends have produced their candidates.
+        fetch_limit = limit + offset + 200
         cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
-        
-        # `set -o pipefail` so rg's exit status propagates through `| head`.
-        # Without it the pipeline reports head's status (0), masking rg's
-        # error code (2) and making the guard below unreachable. rg handles a
-        # truncating head cleanly (exit 0 on SIGPIPE), so pipefail does not
-        # introduce false errors on a successful-but-truncated search.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        try:
+            result = self._exec(cmd, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            scope.mark_incomplete(f"ripgrep backend failed ({type(exc).__name__})")
+            return SearchResult(error=f"Search failed: {exc}", scope=scope)
+
         stdout, limit_reason = _search_stdout_and_limit(result)
-
-        # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
-        # diagnostic lines ("rg: <file>: <error>", "rg: regex parse error:")
-        # are interleaved with match output. Split them out: diagnostics must
-        # not be parsed as matches, and on a hard error they ARE the message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
+        if len(payload.splitlines()) >= fetch_limit:
+            scope.mark_incomplete("backend result collection reached its cap")
+        if limit_reason:
+            scope.mark_incomplete(
+                "search timed out" if limit_reason == "search_timeout"
+                else "terminal output was truncated"
+            )
+        if result.exit_code == 141:
+            scope.mark_incomplete("backend output was truncated at the result cap")
+        elif result.exit_code not in {0, 1, 2, 124}:
+            scope.mark_incomplete(f"ripgrep exited with status {result.exit_code}")
+            detail = diagnostics.strip() or stdout.strip() or "unknown backend error"
+            return SearchResult(error=f"Search failed: {detail}", scope=scope)
+        elif result.exit_code == 2:
+            scope.mark_incomplete("ripgrep reported a partial search error")
+            if not payload.strip():
+                error_msg = diagnostics.strip() or stdout.strip() or "Search error"
+                return SearchResult(
+                    error=f"Search failed: {error_msg}",
+                    total_count=0,
+                    scope=scope,
+                )
+        elif diagnostics:
+            scope.mark_incomplete("ripgrep emitted search diagnostics")
 
-        # rg exit codes: 0=matches found, 1=no matches, 2=error. rg returns 2
-        # even on partial errors (e.g. one unreadable file in a tree that
-        # otherwise matched), so only surface an error when exit==2 AND no
-        # usable match payload remains. Otherwise we keep the real matches.
-        if result.exit_code == 2 and not payload.strip():
-            error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+        return self._parse_content_search_payload(
+            payload,
+            output_mode,
+            limit,
+            offset,
+            context,
+            limit_reason,
+            scope,
+        )
 
-        # Parse the diagnostic-free payload so error text never becomes a match.
-        stdout = payload
-        # Parse results based on output mode
-        if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split('\n') if f]
-            total = len(all_files)
-            page = all_files[offset:offset + limit]
-            return SearchResult(
-                files=page,
-                total_count=total,
-                truncated=bool(limit_reason),
-                limit_reason=limit_reason,
-            )
-        
-        elif output_mode == "count":
-            counts = {}
-            for line in stdout.strip().split('\n'):
-                if ':' in line:
-                    parts = line.rsplit(':', 1)
-                    if len(parts) == 2:
-                        try:
-                            counts[parts[0]] = int(parts[1])
-                        except ValueError:
-                            pass
-            return SearchResult(
-                counts=counts,
-                total_count=sum(counts.values()),
-                truncated=bool(limit_reason),
-                limit_reason=limit_reason,
-            )
-        
-        else:
-            # Parse content matches and context lines.
-            # rg match lines:   "file:lineno:content"  (colon separator)
-            # rg context lines: "file-lineno-content"   (dash separator)
-            # rg group seps:    "--"
-            # Note: on Windows, paths contain drive letters (e.g. C:\path),
-            # so naive split(":") breaks. Use regex to handle both platforms.
-            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
-            matches = []
-            for line in stdout.strip().split('\n'):
-                if not line or line == "--":
-                    continue
-                
-                # Try match line first (colon-separated: file:line:content)
-                m = _match_re.match(line)
-                if m:
-                    matches.append(SearchMatch(
-                        path=(m.group(1) or '') + m.group(2),
-                        line_number=int(m.group(3)),
-                        content=m.group(4)[:500]
-                    ))
-                    continue
-                
-                # Try context line (dash-separated: file-line-content)
-                # Only attempt if context was requested to avoid false positives
-                if context > 0:
-                    parsed = _parse_search_context_line(line)
-                    if parsed:
-                        matches.append(SearchMatch(
-                            path=parsed[0],
-                            line_number=parsed[1],
-                            content=parsed[2][:500]
-                        ))
-            
-            total = len(matches)
-            page = matches[offset:offset + limit]
-            return SearchResult(
-                matches=page,
-                total_count=total,
-                truncated=total > offset + limit or bool(limit_reason),
-                limit_reason=limit_reason,
-            )
+    @staticmethod
+    def _search_root_is_git_metadata(scope: SearchScope) -> bool:
+        if ".git" in Path(scope.normalized_root).parts:
+            return True
+        if not scope.git_worktree_root:
+            return False
+        git_dir = os.path.join(scope.git_worktree_root, ".git")
+        try:
+            return os.path.commonpath(
+                [scope.normalized_root, git_dir]
+            ) == git_dir
+        except ValueError:
+            return False
     
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
-                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
-        """Fallback search using grep."""
-        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
-        
-        # Exclude hidden directories (matching ripgrep's default behavior).
-        # This prevents searching inside .hub/index-cache/, .git/, etc.
-        cmd_parts.append("--exclude-dir='.*'")
-        
+                          limit: int, offset: int, output_mode: str, context: int,
+                          path_kind: str = "directory") -> SearchResult:
+        """Fallback search using grep, then apply the shared scope policy."""
+        scope = self._content_search_scope(path, path_kind, "grep")
+        cmd_parts = ["grep", "-rnH"]  # -H forces filenames for single-file searches
+        if (
+            not scope.explicit_file
+            and not self._search_root_is_git_metadata(scope)
+        ):
+            cmd_parts.extend(["--exclude-dir", self._escape_shell_arg(".git")])
+
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
@@ -2282,8 +2686,8 @@ class ShellFileOperations(FileOperations):
         cmd_parts.append(self._escape_shell_arg(pattern))
         cmd_parts.append(self._escape_shell_arg(path))
         
-        # Fetch generously so we can compute total before slicing
-        fetch_limit = limit + offset + (200 if context > 0 else 0)
+        # Fetch beyond the requested page so both backends can share scope filtering.
+        fetch_limit = limit + offset + 200
         cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
         
         # `set -o pipefail` so grep's exit status propagates through `| head`
@@ -2292,7 +2696,11 @@ class ShellFileOperations(FileOperations):
         # successful search; the strict `== 2` guard below ignores that, so
         # pipefail does not turn truncated results into false errors.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        try:
+            result = self._exec(cmd, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            scope.mark_incomplete(f"grep backend failed ({type(exc).__name__})")
+            return SearchResult(error=f"Search failed: {exc}", scope=scope)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout, so grep's diagnostic lines
@@ -2301,79 +2709,37 @@ class ShellFileOperations(FileOperations):
         # clean message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
 
-        # grep exit codes: 0=matches found, 1=no matches, 2=error. grep
-        # returns 2 on partial errors (e.g. an unreadable file) even when
-        # other files matched, so only surface an error when exit==2 AND no
-        # usable match payload remains.
-        if result.exit_code == 2 and not payload.strip():
-            error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+        if len(payload.splitlines()) >= fetch_limit:
+            scope.mark_incomplete("backend result collection reached its cap")
+        if limit_reason:
+            scope.mark_incomplete(
+                "search timed out" if limit_reason == "search_timeout"
+                else "terminal output was truncated"
+            )
+        if result.exit_code == 141:
+            scope.mark_incomplete("backend output was truncated at the result cap")
+        elif result.exit_code not in {0, 1, 2, 124}:
+            scope.mark_incomplete(f"grep exited with status {result.exit_code}")
+            detail = diagnostics.strip() or stdout.strip() or "unknown backend error"
+            return SearchResult(error=f"Search failed: {detail}", scope=scope)
+        elif result.exit_code == 2:
+            scope.mark_incomplete("grep reported a partial search error")
+            if not payload.strip():
+                error_msg = diagnostics.strip() or stdout.strip() or "Search error"
+                return SearchResult(
+                    error=f"Search failed: {error_msg}",
+                    total_count=0,
+                    scope=scope,
+                )
+        elif diagnostics:
+            scope.mark_incomplete("grep emitted search diagnostics")
 
-        stdout = payload
-        if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split('\n') if f]
-            total = len(all_files)
-            page = all_files[offset:offset + limit]
-            return SearchResult(
-                files=page,
-                total_count=total,
-                truncated=bool(limit_reason),
-                limit_reason=limit_reason,
-            )
-        
-        elif output_mode == "count":
-            counts = {}
-            for line in stdout.strip().split('\n'):
-                if ':' in line:
-                    parts = line.rsplit(':', 1)
-                    if len(parts) == 2:
-                        try:
-                            counts[parts[0]] = int(parts[1])
-                        except ValueError:
-                            pass
-            return SearchResult(
-                counts=counts,
-                total_count=sum(counts.values()),
-                truncated=bool(limit_reason),
-                limit_reason=limit_reason,
-            )
-        
-        else:
-            # grep match lines:   "file:lineno:content" (colon)
-            # grep context lines: "file-lineno-content"  (dash)
-            # grep group seps:    "--"
-            # Note: on Windows, paths contain drive letters (e.g. C:\path),
-            # so naive split(":") breaks. Use regex to handle both platforms.
-            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
-            matches = []
-            for line in stdout.strip().split('\n'):
-                if not line or line == "--":
-                    continue
-                
-                m = _match_re.match(line)
-                if m:
-                    matches.append(SearchMatch(
-                        path=(m.group(1) or '') + m.group(2),
-                        line_number=int(m.group(3)),
-                        content=m.group(4)[:500]
-                    ))
-                    continue
-                
-                if context > 0:
-                    parsed = _parse_search_context_line(line)
-                    if parsed:
-                        matches.append(SearchMatch(
-                            path=parsed[0],
-                            line_number=parsed[1],
-                            content=parsed[2][:500]
-                        ))
-
-            
-            total = len(matches)
-            page = matches[offset:offset + limit]
-            return SearchResult(
-                matches=page,
-                total_count=total,
-                truncated=total > offset + limit or bool(limit_reason),
-                limit_reason=limit_reason,
-            )
+        return self._parse_content_search_payload(
+            payload,
+            output_mode,
+            limit,
+            offset,
+            context,
+            limit_reason,
+            scope,
+        )

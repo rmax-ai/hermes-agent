@@ -12,11 +12,13 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -203,7 +205,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    _jobs_lock,
+    advance_next_run,
+    get_due_jobs,
+    load_jobs,
+    mark_job_run,
+    save_job_output,
+    save_jobs,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -710,7 +720,248 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+_SCHEDULED_TEXT_THRESHOLD = 3800
+
+
+def _scheduled_run_id(job: dict, explicit: Optional[str] = None) -> str:
+    """Return the stable identifier for one scheduled firing.
+
+    ``next_run_at`` is the scheduled fire time captured in the due-job record.
+    It stays stable if delivery is retried before ``mark_job_run`` advances the
+    schedule, which lets the receipt/ambiguous-timeout guard cover a restart.
+    """
+    value = explicit or job.get("_scheduled_run_id") or job.get("run_id")
+    if value:
+        return str(value)
+    fire_at = job.get("next_run_at") or job.get("last_run_at") or _hermes_now().isoformat()
+    value = f"{job.get('id', 'cron-job')}:{fire_at}"
+    # Keep direct callers (and an in-process explicit retry) on the same
+    # firing id even when a hand-built job has no scheduled timestamp.
+    job["_scheduled_run_id"] = value
+    return value
+
+
+def _scheduled_payload_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _telegram_scheduled_document_required(content: str) -> bool:
+    """Mirror Telegram's UTF-16 length accounting at the scheduler boundary."""
+    return len(content.encode("utf-16-le")) // 2 > _SCHEDULED_TEXT_THRESHOLD
+
+
+def _iter_delivery_receipts(job: dict):
+    """Yield additive receipt records from old and new job shapes."""
+    raw = job.get("delivery_receipts")
+    if isinstance(raw, list):
+        yield from (item for item in raw if isinstance(item, dict))
+    elif isinstance(raw, dict):
+        # Accept a future destination-keyed shape without making the current
+        # list-backed store format brittle.
+        yield from (item for item in raw.values() if isinstance(item, dict))
+    last = job.get("last_delivery_receipt")
+    if isinstance(last, dict):
+        yield last
+    singular = job.get("delivery_receipt")
+    if isinstance(singular, dict):
+        yield singular
+
+
+def _has_successful_delivery_receipt(
+    job: dict,
+    run_id: str,
+    payload_sha256: str,
+) -> bool:
+    """Return whether this run/payload was already delivered successfully."""
+    return any(
+        receipt.get("run_id") == run_id
+        and receipt.get("payload_sha256") == payload_sha256
+        and receipt.get("platform_message_id")
+        for receipt in _iter_delivery_receipts(job)
+    )
+
+
+def _has_ambiguous_delivery_attempt(
+    job: dict,
+    run_id: str,
+    payload_sha256: str,
+) -> bool:
+    attempt = job.get("last_delivery_attempt")
+    return (
+        isinstance(attempt, dict)
+        and attempt.get("run_id") == run_id
+        and attempt.get("payload_sha256") == payload_sha256
+        and attempt.get("status") == "ambiguous_timeout"
+    )
+
+
+def _persist_delivery_receipt(job: dict, receipt: dict) -> None:
+    """Persist a successful receipt alongside the existing cron job record."""
+    job["last_delivery_receipt"] = receipt
+    receipts = job.setdefault("delivery_receipts", [])
+    if not isinstance(receipts, list):
+        receipts = []
+        job["delivery_receipts"] = receipts
+    if not any(
+        item.get("run_id") == receipt["run_id"]
+        and item.get("payload_sha256") == receipt["payload_sha256"]
+        and item.get("platform_message_id") == receipt["platform_message_id"]
+        for item in receipts
+        if isinstance(item, dict)
+    ):
+        receipts.append(receipt)
+    # Keep recurring-job bookkeeping bounded while retaining enough recent
+    # history to cover a restart/replay of the same scheduled firing.
+    del receipts[:-50]
+    job["last_delivery_attempt"] = None
+
+    try:
+        with _jobs_lock():
+            jobs = load_jobs()
+            for stored_job in jobs:
+                if stored_job.get("id") != job.get("id"):
+                    continue
+                stored_receipts = stored_job.get("delivery_receipts")
+                if not isinstance(stored_receipts, list):
+                    stored_receipts = []
+                if not any(
+                    item.get("run_id") == receipt["run_id"]
+                    and item.get("payload_sha256") == receipt["payload_sha256"]
+                    and item.get("platform_message_id") == receipt["platform_message_id"]
+                    for item in stored_receipts
+                    if isinstance(item, dict)
+                ):
+                    stored_receipts.append(receipt)
+                stored_job["delivery_receipts"] = stored_receipts[-50:]
+                stored_job["last_delivery_receipt"] = receipt
+                stored_job["last_delivery_attempt"] = None
+                save_jobs(jobs)
+                break
+    except Exception:
+        # A successful platform response must not be turned into a user-visible
+        # delivery failure solely because local bookkeeping was unavailable.
+        logger.warning(
+            "Job '%s': could not persist scheduled delivery receipt",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+
+
+def _persist_ambiguous_delivery_attempt(
+    job: dict,
+    run_id: str,
+    payload_sha256: str,
+    error: str,
+) -> None:
+    """Persist an ambiguous timeout so the same firing is never auto-resubmitted."""
+    attempt = {
+        "run_id": run_id,
+        "payload_sha256": payload_sha256,
+        "status": "ambiguous_timeout",
+    }
+    job["last_delivery_attempt"] = attempt
+    try:
+        with _jobs_lock():
+            jobs = load_jobs()
+            for stored_job in jobs:
+                if stored_job.get("id") != job.get("id"):
+                    continue
+                stored_job["last_delivery_attempt"] = attempt
+                stored_job["last_delivery_error"] = error
+                save_jobs(jobs)
+                break
+    except Exception:
+        logger.warning(
+            "Job '%s': could not persist ambiguous scheduled delivery attempt",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+
+
+def _receipt_from_send_result(
+    result,
+    *,
+    run_id: str,
+    payload_sha256: str,
+    default_kind: str = "text",
+) -> Optional[dict]:
+    """Normalize adapter and standalone sender results to the receipt schema."""
+    if result is None:
+        return None
+
+    if isinstance(result, dict):
+        nested = result.get("receipt")
+        if isinstance(nested, dict):
+            result = nested
+        if isinstance(result, dict) and {
+            "run_id",
+            "payload_sha256",
+            "delivery_kind",
+            "platform_message_id",
+            "delivered_at",
+        }.issubset(result):
+            return {
+                "run_id": str(result["run_id"]),
+                "payload_sha256": str(result["payload_sha256"]),
+                "delivery_kind": str(result["delivery_kind"]),
+                "platform_message_id": str(result["platform_message_id"]),
+                "delivered_at": result["delivered_at"],
+            }
+        if nested is not None:
+            return None
+        else:
+            if not result.get("success") or not result.get("message_id"):
+                return None
+            return {
+                "run_id": run_id,
+                "payload_sha256": payload_sha256,
+                "delivery_kind": result.get("delivery_kind", default_kind),
+                "platform_message_id": str(result["message_id"]),
+                "delivered_at": result.get("delivered_at") or _hermes_now().isoformat(),
+            }
+
+    message_id = getattr(result, "platform_message_id", None) or getattr(result, "message_id", None)
+    if not message_id:
+        return None
+    success = getattr(result, "success", True)
+    if success is False:
+        return None
+    return {
+        "run_id": run_id,
+        "payload_sha256": payload_sha256,
+        "delivery_kind": getattr(result, "delivery_kind", None) or default_kind,
+        "platform_message_id": str(message_id),
+        "delivered_at": getattr(result, "delivered_at", None) or _hermes_now().isoformat(),
+    }
+
+
+def _is_ambiguous_timeout(error: BaseException | str) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in ("timeout", "timed out", "timedout"))
+
+
+def _delivery_failure(
+    job: dict,
+    *,
+    run_id: str,
+    payload_sha256: str,
+    error: BaseException | str,
+) -> str:
+    """Format and persist a delivery failure, preserving timeout ambiguity."""
+    if _is_ambiguous_timeout(error):
+        message = f"ambiguous_timeout: {error}"
+        _persist_ambiguous_delivery_attempt(job, run_id, payload_sha256, message)
+        return message
+    return str(error)
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    run_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -768,11 +1019,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+    run_id = _scheduled_run_id(job, run_id)
 
     for target in targets:
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        text_to_send = cleaned_delivery_content.strip()
+        payload_sha256 = _scheduled_payload_sha256(text_to_send)
+        telegram_document = (
+            platform_name.lower() == "telegram"
+            and _telegram_scheduled_document_required(text_to_send)
+        )
+
+        if _has_successful_delivery_receipt(job, run_id, payload_sha256):
+            logger.info(
+                "Job '%s': suppressing duplicate scheduled delivery to %s:%s",
+                job["id"],
+                platform_name,
+                chat_id,
+            )
+            continue
+        if _has_ambiguous_delivery_attempt(job, run_id, payload_sha256):
+            delivery_errors.append(
+                f"ambiguous_timeout: scheduled delivery to {platform_name}:{chat_id} "
+                f"for run {run_id} was not retried"
+            )
+            continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -810,16 +1083,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        scheduled_sender = None
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
-                text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
+                    scheduled_sender = getattr(type(runtime_adapter), "send_scheduled_output", None)
+                    if scheduled_sender is not None:
+                        send_coro = runtime_adapter.send_scheduled_output(
+                            text_to_send,
+                            destination=chat_id,
+                            run_id=run_id,
+                            metadata=send_metadata,
+                            job_name=job.get("name") or job.get("id") or "cron job",
+                        )
+                    else:
+                        send_coro = runtime_adapter.send(
+                            chat_id, text_to_send, metadata=send_metadata
+                        )
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        send_coro,
                         loop,
                     )
                     if future is None:
@@ -837,6 +1123,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 job["id"], platform_name, chat_id, err,
                             )
                             adapter_ok = False  # fall through to standalone path
+                            if scheduled_sender is not None and (
+                                telegram_document or _is_ambiguous_timeout(err)
+                            ):
+                                delivery_errors.append(
+                                    _delivery_failure(
+                                        job,
+                                        run_id=run_id,
+                                        payload_sha256=payload_sha256,
+                                        error=err,
+                                    )
+                                )
+                                # A scheduled document was selected before the
+                                # request. Never recover it by sending the
+                                # same payload through the chunking path.
+                                if telegram_document or _is_ambiguous_timeout(err):
+                                    adapter_ok = False
+                                    delivered = True
                         elif (
                             send_result
                             and thread_id
@@ -850,6 +1153,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             )
                             logger.warning("Job '%s': %s", job["id"], msg)
                             delivery_errors.append(msg)
+                        if send_result:
+                            receipt = _receipt_from_send_result(
+                                send_result,
+                                run_id=run_id,
+                                payload_sha256=payload_sha256,
+                                default_kind="document" if telegram_document else "text",
+                            )
+                            if receipt:
+                                _persist_delivery_receipt(job, receipt)
+                            elif getattr(send_result, "success", False) and telegram_document:
+                                delivery_errors.append(
+                                    "scheduled document delivery returned no platform message id"
+                                )
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
@@ -871,10 +1187,39 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
                     job["id"], platform_name, chat_id, e,
                 )
+                if scheduled_sender is not None or telegram_document:
+                    delivery_errors.append(
+                        _delivery_failure(
+                            job,
+                            run_id=run_id,
+                            payload_sha256=payload_sha256,
+                            error=e,
+                        )
+                    )
+                    delivered = True
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            if telegram_document:
+                from gateway.platforms.telegram import send_scheduled_output_standalone
+                send_metadata = {"thread_id": thread_id} if thread_id else None
+                coro = send_scheduled_output_standalone(
+                    pconfig,
+                    text_to_send,
+                    destination=chat_id,
+                    run_id=run_id,
+                    metadata=send_metadata,
+                    job_name=job.get("name") or job.get("id") or "cron job",
+                )
+            else:
+                coro = _send_to_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    text_to_send,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -884,25 +1229,224 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    if telegram_document:
+                        retry_coro = send_scheduled_output_standalone(
+                            pconfig,
+                            text_to_send,
+                            destination=chat_id,
+                            run_id=run_id,
+                            metadata={"thread_id": thread_id} if thread_id else None,
+                            job_name=job.get("name") or job.get("id") or "cron job",
+                        )
+                    else:
+                        retry_coro = _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            text_to_send,
+                            thread_id=thread_id,
+                            media_files=media_files,
+                        )
+                    future = pool.submit(asyncio.run, retry_coro)
                     result = future.result(timeout=30)
             except Exception as e:
-                msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                if telegram_document or scheduled_sender is not None:
+                    msg = _delivery_failure(
+                        job,
+                        run_id=run_id,
+                        payload_sha256=payload_sha256,
+                        error=e,
+                    )
+                else:
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+            if isinstance(result, dict) and result.get("error"):
+                msg = _delivery_failure(
+                    job,
+                    run_id=run_id,
+                    payload_sha256=payload_sha256,
+                    error=result["error"],
+                )
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            if result is not None and not isinstance(result, dict) and not getattr(result, "success", True):
+                error = getattr(result, "error", None) or "unknown delivery error"
+                msg = _delivery_failure(
+                    job,
+                    run_id=run_id,
+                    payload_sha256=payload_sha256,
+                    error=error,
+                )
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
 
+            receipt = _receipt_from_send_result(
+                result,
+                run_id=run_id,
+                payload_sha256=payload_sha256,
+                default_kind="document" if telegram_document else "text",
+            )
+            if receipt:
+                _persist_delivery_receipt(job, receipt)
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Cost footer (local patch, v2)
+#
+# Every fired job reports what the run cost. The number is read from the
+# session store (state.db), keyed by the EXACT session id captured from the
+# invocation itself (run_job's ``cost_capture`` out-param) — never inferred
+# from a job-id prefix plus timestamps. Aggregation walks the full session
+# lineage with a recursive CTE, so delegated subagent rows and context-
+# compression continuation sessions are all included. The in-memory capture
+# doubles as a fallback when the store is unreadable. Best-effort: any
+# failure degrades to an explicit static line — it must never break delivery.
+# ---------------------------------------------------------------------------
+
+def _read_cron_run_cost(session_id: str) -> Optional[dict]:
+    """Read a run's cost across its full session lineage, or None.
+
+    ``session_id`` must be the exact id captured for this invocation. The
+    recursive CTE walks ``parent_session_id`` links so delegated children
+    and compression continuations of any depth are aggregated.
+    """
+    try:
+        db_path = _get_hermes_home() / "state.db"
+        if not db_path.exists():
+            return None
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = con.execute(
+                "WITH RECURSIVE lineage(id) AS ("
+                "  SELECT id FROM sessions WHERE id = ?"
+                "  UNION ALL"
+                "  SELECT s.id FROM sessions s JOIN lineage l "
+                "    ON s.parent_session_id = l.id"
+                ") "
+                "SELECT s.id, s.model, s.estimated_cost_usd, s.cost_status, "
+                "       s.cost_source, s.api_call_count, s.input_tokens, s.output_tokens "
+                "FROM sessions s WHERE s.id IN (SELECT id FROM lineage)",
+                (session_id,),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("cron cost footer: state.db lineage read failed", exc_info=True)
+        return None
+    if not rows:
+        return None
+
+    root = next((r for r in rows if r[0] == session_id), None)
+    has_unpriced = False
+    has_included = False
+    sources = set()
+    for r in rows:
+        status = (r[3] or "").strip().lower()
+        source = (r[4] or "").strip().lower()
+        if source:
+            sources.add(source)
+        if status == "included":
+            has_included = True
+        elif status == "unknown" or source in ("", "none", "unknown"):
+            has_unpriced = True
+    return {
+        "model": (root[1] if root else None) or (rows[0][1] if rows else None),
+        "cost_usd": sum(float(r[2] or 0.0) for r in rows),
+        "api_calls": sum(int(r[5] or 0) for r in rows),
+        "input_tokens": sum(int(r[6] or 0) for r in rows),
+        "output_tokens": sum(int(r[7] or 0) for r in rows),
+        "has_unpriced": has_unpriced,
+        "has_included": has_included,
+        "sources": sorted(sources),
+    }
+
+
+def _capture_run_cost_info(capture: dict) -> Optional[dict]:
+    """Build cost info from the in-memory capture (no store access)."""
+    if "cost_usd" not in capture:
+        return None
+    status = (capture.get("cost_status") or "").strip().lower()
+    source = (capture.get("cost_source") or "").strip().lower()
+    has_included = status == "included"
+    has_unpriced = (not has_included) and (
+        status == "unknown" or source in ("", "none", "unknown")
+    )
+    return {
+        "model": capture.get("model"),
+        "cost_usd": float(capture.get("cost_usd") or 0.0),
+        "api_calls": int(capture.get("api_calls") or 0),
+        "input_tokens": int(capture.get("input_tokens") or 0),
+        "output_tokens": int(capture.get("output_tokens") or 0),
+        "has_unpriced": has_unpriced,
+        "has_included": has_included,
+        "sources": sorted({source} - {""}) if source else [],
+    }
+
+
+def _format_cron_cost_footer(job: dict, capture: Optional[dict]) -> tuple:
+    """Return (delivery_line, archive_section) describing this run's cost.
+
+    Always returns an explicit pair — jobs that never reached an LLM get a
+    static "no LLM calls" line, and an unreadable store without captured
+    numbers gets "unavailable" — so every job's output carries a cost
+    statement. ``no_agent`` script jobs never touch the store at all.
+    """
+    if job.get("no_agent"):
+        return (
+            "💰 Cost: $0.0000 (script-only)",
+            "## Cost\n\n$0.0000 USD (script-only — no LLM calls)",
+        )
+    capture = capture or {}
+    session_id = capture.get("session_id")
+    if not session_id:
+        # run_job exited before creating a session (wake-gate skip, blocked
+        # prompt, no script output, crash before agent init) — no LLM spend.
+        return (
+            "💰 Cost: $0.0000 (no LLM calls)",
+            "## Cost\n\n$0.0000 USD (no LLM calls — agent did not run)",
+        )
+
+    info = _read_cron_run_cost(session_id)
+    if info is None:
+        # Store unreadable — fall back to the in-memory capture when present.
+        info = _capture_run_cost_info(capture)
+    if info is None:
+        return (
+            "💰 Cost: unavailable",
+            "## Cost\n\nUnavailable — could not read the run's session record.",
+        )
+
+    cost = info["cost_usd"]
+    marker = ""
+    if cost <= 0.0:
+        if info["has_unpriced"]:
+            marker = " (unpriced)"
+        elif info["has_included"]:
+            marker = " (subscription)"
+    elif info["has_unpriced"]:
+        marker = " (partially unpriced)"
+    calls = info["api_calls"]
+    calls_word = "call" if calls == 1 else "calls"
+    model = info["model"] or capture.get("model") or "unknown"
+    sources = ", ".join(info["sources"]) if info["sources"] else "none"
+    delivery_line = f"💰 Cost: ${cost:.4f}{marker} · {model} · {calls} {calls_word}"
+    archive_section = (
+        "## Cost\n\n"
+        f"${cost:.4f} USD · {model} · {calls} API {calls_word} "
+        f"· {info['input_tokens']:,} in / {info['output_tokens']:,} out tokens "
+        f"· pricing: {sources}"
+    )
+    return delivery_line, archive_section
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
@@ -943,6 +1487,66 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+# uv reports these two causes when a script env is missing and the network is
+# disabled. Both clear on a single online retry.
+_OFFLINE_ENV_MISS_RE = re.compile(
+    r"network was disabled|No solution found when resolving script dependencies",
+    re.IGNORECASE,
+)
+
+# Interpreter for cron Python scripts. Pinned to the minor version so a uv
+# toolchain update cannot move 200+ operational scripts to a new Python at
+# once. Scripts that need another version declare ``requires-python`` in their
+# own PEP 723 block, which takes precedence at resolution time.
+_SCRIPT_PYTHON = "3.12"
+
+
+def _python_script_argv(path: Path) -> Optional[list[str]]:
+    """Build the interpreter argv for a cron Python script.
+
+    Python scripts never run on Hermes' own interpreter. ``uv run
+    --no-project`` gives every script its own environment, keyed on the PEP 723
+    ``# /// script`` block when one is present and on an empty dependency set
+    when it is not. The Hermes venv therefore stays limited to Hermes' own
+    locked dependencies, and one script's dependency can never collide with
+    another's.
+
+    ``--python`` is explicit because uv otherwise selects its newest managed
+    interpreter, which is newer than the version Hermes ships and tests against.
+
+    Returns ``None`` when ``uv`` is not on PATH so the caller can fail closed
+    with a message that names the fix.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        return None
+    return [
+        uv,
+        "run",
+        "--no-project",
+        "--python",
+        _SCRIPT_PYTHON,
+        "--offline",
+        str(path),
+    ]
+
+
+def _script_subprocess_env() -> dict:
+    """Sanitized environment for a cron job script.
+
+    ``VIRTUAL_ENV`` and ``PYTHONHOME`` are removed on purpose. ``uv run``
+    adopts an active virtual environment when one is inherited, so a leaked
+    Hermes venv would silently defeat the isolation this module provides. The
+    gateway service exports ``VIRTUAL_ENV`` for its own use.
+    """
+    from tools.environments.local import _sanitize_subprocess_env
+
+    env = _sanitize_subprocess_env(os.environ.copy())
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("PYTHONHOME", None)
+    return env
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -954,9 +1558,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     Supported interpreters (chosen by file extension):
 
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
-    * anything else — run with the current Python interpreter
-      (``sys.executable``), preserving the original behaviour for
-      Python-based pre-check and data-collection scripts.
+    * anything else — run with ``uv run --no-project``, so each script gets
+      its own environment (PEP 723 dependencies when declared, an empty set
+      otherwise) and never borrows Hermes' interpreter or packages.
 
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
@@ -1001,10 +1605,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     script_timeout = _get_script_timeout()
 
-    # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
-    # shebang: the scripts dir is trusted, but keeping the interpreter
-    # choice explicit here keeps the allowed surface small and auditable.
+    # Pick an interpreter by extension.  Bash for .sh/.bash, uv for Python.
+    # We deliberately do NOT honour the file's own shebang: the scripts dir is
+    # trusted, but keeping the interpreter choice explicit here keeps the
+    # allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
@@ -1023,21 +1627,40 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             )
         argv = [_bash, str(path)]
     else:
-        argv = [sys.executable, str(path)]
+        argv = _python_script_argv(path)
+        if argv is None:
+            return False, (
+                f"Cannot run Python script {path.name!r}: uv was not found on PATH. "
+                "Cron Python scripts run in their own uv environment so that the "
+                "Hermes venv stays limited to Hermes' own dependencies. Install uv "
+                "or expose it on the service PATH."
+            )
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
-
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
-            argv,
+        run_kwargs = dict(
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_script_subprocess_env(),
             **popen_kwargs,
         )
+        result = subprocess.run(argv, **run_kwargs)
+        if (
+            result.returncode != 0
+            and "--offline" in argv
+            and _OFFLINE_ENV_MISS_RE.search(result.stderr or "")
+        ):
+            # The script's environment is absent and the network is disabled:
+            # a dependency block changed, or the uv cache was cleaned. Retry
+            # once with network access instead of failing the job.
+            logger.info(
+                "cron script %s: uv environment missing offline, retrying online",
+                path.name,
+            )
+            online_argv = [part for part in argv if part != "--offline"]
+            result = subprocess.run(online_argv, **run_kwargs)
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
@@ -1364,10 +1987,16 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict, cost_capture: Optional[dict] = None) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
+    ``cost_capture`` (optional out-param, local patch): when a dict is
+    passed, it is filled with this run's exact session id and accounting
+    (in-memory totals from the agent, which include delegated-subagent
+    roll-up) so the caller can report the run's cost without guessing by
+    job-id prefix. Never raises into the run.
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -1546,6 +2175,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    if cost_capture is not None:
+        cost_capture["session_id"] = _cron_session_id
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1942,6 +2573,24 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        # Cost capture (local patch): record the exact session id and the
+        # agent's authoritative in-memory totals for this run. The result
+        # dict includes delegated-subagent roll-up.
+        if cost_capture is not None:
+            try:
+                cost_capture.update({
+                    "session_id": result.get("session_id") or _cron_session_id,
+                    "model": result.get("model"),
+                    "cost_usd": float(result.get("estimated_cost_usd") or 0.0),
+                    "cost_status": result.get("cost_status"),
+                    "cost_source": result.get("cost_source"),
+                    "input_tokens": int(result.get("input_tokens") or 0),
+                    "output_tokens": int(result.get("output_tokens") or 0),
+                    "api_calls": int(result.get("api_calls") or 0),
+                })
+            except Exception:
+                logger.debug("cost capture (success path) failed", exc_info=True)
         
         output = f"""# Cron Job: {job_name}
 
@@ -1981,6 +2630,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
+        # Cost capture (local patch, failure path): the agent may have spent
+        # tokens before dying — keep whatever it accounted for. The formatter
+        # falls back to a DB read keyed by the captured session id.
+        if cost_capture is not None:
+            try:
+                cost_capture.setdefault("session_id", _cron_session_id)
+                if agent is not None:
+                    cost_capture["model"] = getattr(agent, "model", None)
+                    cost_capture["cost_usd"] = float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
+                    cost_capture["cost_status"] = getattr(agent, "session_cost_status", None)
+                    cost_capture["cost_source"] = getattr(agent, "session_cost_source", None)
+                    cost_capture["input_tokens"] = int(getattr(agent, "session_input_tokens", 0) or 0)
+                    cost_capture["output_tokens"] = int(getattr(agent, "session_output_tokens", 0) or 0)
+                    cost_capture["api_calls"] = int(getattr(agent, "session_api_calls", 0) or 0)
+            except Exception:
+                logger.debug("cost capture (failure path) failed", exc_info=True)
+
         return False, output, "", error_msg
 
     finally:
@@ -2053,7 +2719,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     try:
-        success, output, final_response, error = run_job(job)
+        _cost_capture: dict = {}
+        success, output, final_response, error = run_job(job, cost_capture=_cost_capture)
+
+        # Cost footer (local patch): append this run's cost to the archived
+        # output now, and to any delivered message below.
+        _cost_line, _cost_section = _format_cron_cost_footer(job, _cost_capture)
+        if _cost_section:
+            output = output.rstrip("\n") + "\n\n" + _cost_section + "\n"
 
         output_file = save_job_output(job["id"], output)
         if verbose:
@@ -2073,6 +2746,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         delivery_error = None
         if should_deliver:
+            if _cost_line:
+                deliver_content = deliver_content.rstrip("\n") + "\n\n" + _cost_line
             try:
                 delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
             except Exception as de:

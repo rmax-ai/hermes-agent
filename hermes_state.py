@@ -705,6 +705,18 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # Read-only FTS availability probe: no DDL, no write lock.
+                # Without this, cross-profile discovery (session_search with
+                # profile=...) silently returns [] because _fts_enabled stays
+                # False from init and search_messages short-circuits.
+                try:
+                    row = self._conn.execute(
+                        "SELECT count(*) FROM sqlite_master "
+                        "WHERE type='table' AND name='messages_fts'"
+                    ).fetchone()
+                    self._fts_enabled = bool(row and row[0])
+                except sqlite3.DatabaseError:
+                    self._fts_enabled = False
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

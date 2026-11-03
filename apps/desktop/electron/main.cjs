@@ -272,8 +272,19 @@ const HERMES_HOME = resolveHermesHome()
 // install.ps1 / install.sh use, so a desktop-only user and a CLI-only user end
 // up with identical layouts and can share one install.
 const ACTIVE_HERMES_ROOT = path.join(HERMES_HOME, 'hermes-agent')
-// VENV_ROOT — venv lives inside the repo, exactly like install.ps1 does it.
-const VENV_ROOT = path.join(ACTIVE_HERMES_ROOT, 'venv')
+
+function resolvePreferredVenvRoot(root) {
+  const dotVenv = path.join(root, '.venv')
+  if (directoryExists(dotVenv)) return dotVenv
+
+  const legacyVenv = path.join(root, 'venv')
+  if (directoryExists(legacyVenv)) return legacyVenv
+
+  return dotVenv
+}
+
+// VENV_ROOT — prefer the active .venv, fall back to legacy venv for older installs.
+const VENV_ROOT = resolvePreferredVenvRoot(ACTIVE_HERMES_ROOT)
 // BOOTSTRAP_COMPLETE_MARKER — written by the first-launch bootstrap runner
 // (Phase 1D) after install.ps1 has completed all stages and the user has
 // finished initial configuration. Presence of this marker means the install
@@ -2303,7 +2314,7 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
       pythonPathEntries: [root],
-      venvRoot: path.join(root, 'venv')
+      venvRoot: resolvePreferredVenvRoot(root)
     }),
     root,
     bootstrap: Boolean(options.bootstrap),

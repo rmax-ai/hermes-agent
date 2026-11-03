@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Session Search Tool - Long-Term Conversation Recall
+"""Session Search Tool - Long-Term Conversation Recall
 
 Single-shape tool with three calling modes (inferred from args, no explicit
 mode parameter):
@@ -749,9 +748,12 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional. Read sessions from another Hermes profile's database "
-                    "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
-                    "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "(read-only). Pass 'default' to search the MAIN agent's session "
+                    "history — do this whenever you need to recall what was discussed "
+                    "in past conversations of the primary profile. Also use when "
+                    "resolving an `@session:<profile>/<id>` link: pass the profile "
+                    "segment here with session_id as the id segment. Omit to use the "
+                    "current profile."
                 ),
             },
         },

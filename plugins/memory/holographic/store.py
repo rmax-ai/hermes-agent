@@ -216,8 +216,9 @@ class MemoryStore:
                 SELECT f.fact_id, f.content, f.category, f.tags,
                        f.trust_score, f.retrieval_count, f.helpful_count,
                        f.created_at, f.updated_at
-                FROM facts f
-                JOIN facts_fts fts ON fts.rowid = f.fact_id
+                FROM facts_fts fts
+                JOIN (SELECT fact_id FROM recall_facts_v1) el ON el.fact_id = fts.rowid
+                JOIN facts f ON f.fact_id = fts.rowid
                 WHERE facts_fts MATCH ?
                   AND f.trust_score >= ?
                   {category_clause}

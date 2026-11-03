@@ -565,3 +565,156 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
+
+
+class TestUvScriptRuntime:
+    """Python job scripts must run in their own uv environment.
+
+    Regression scope: cron scripts previously ran with ``sys.executable``, so
+    every operational script borrowed the Hermes venv — its interpreter and its
+    packages. One script's dependency and Hermes' dependency could collide, and
+    a Hermes dependency bump silently changed script behaviour.
+    """
+
+    def test_python_argv_uses_uv_run_no_project_offline(self, cron_env):
+        import shutil as _shutil
+
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _python_script_argv
+
+        uv = _shutil.which("uv")
+        if uv is None:
+            pytest.skip("uv is not installed on this host")
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text("print('x')\n")
+
+        argv = _python_script_argv(script)
+        assert argv == [
+            uv,
+            "run",
+            "--no-project",
+            "--python",
+            sched_mod._SCRIPT_PYTHON,
+            "--offline",
+            str(script),
+        ]
+
+    def test_inherited_virtual_env_is_not_adopted(self, cron_env, monkeypatch):
+        """uv adopts an inherited VIRTUAL_ENV, so the scheduler strips it."""
+        import shutil as _shutil
+
+        if _shutil.which("uv") is None:
+            pytest.skip("uv is not installed on this host")
+
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("VIRTUAL_ENV", str(cron_env / "fake-venv"))
+
+        script = cron_env / "scripts" / "venv_probe.py"
+        script.write_text("import sys; print(sys.prefix)\n")
+
+        success, output = _run_job_script("venv_probe.py")
+        assert success is True, output
+        assert "fake-venv" not in output
+        assert "hermes-agent" not in output
+
+    def test_script_does_not_run_on_hermes_interpreter(self, cron_env):
+        """The script's sys.prefix must not be the Hermes venv."""
+        import shutil as _shutil
+
+        if _shutil.which("uv") is None:
+            pytest.skip("uv is not installed on this host")
+
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "prefix_probe.py"
+        script.write_text("import sys; print(sys.prefix); print(sys.executable)\n")
+
+        success, output = _run_job_script("prefix_probe.py")
+        assert success is True, output
+        assert "hermes-agent" not in output
+
+    def test_pep723_block_end_to_end(self, cron_env):
+        """A script that declares its own python version still runs."""
+        import shutil as _shutil
+
+        if _shutil.which("uv") is None:
+            pytest.skip("uv is not installed on this host")
+
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "inline_meta.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                # /// script
+                # requires-python = ">=3.12"
+                # dependencies = []
+                # ///
+                import sys
+                print("ok", sys.version_info.major)
+                """
+            )
+        )
+
+        success, output = _run_job_script("inline_meta.py")
+        assert success is True, output
+        assert output.startswith("ok 3")
+
+    def test_missing_uv_fails_closed(self, cron_env, monkeypatch):
+        """Without uv the job fails with a named cause, never a venv fallback."""
+        from cron import scheduler as sched_mod
+
+        real_which = sched_mod.shutil.which
+
+        def fake_which(name, *args, **kwargs):
+            if name == "uv":
+                return None
+            return real_which(name, *args, **kwargs)
+
+        monkeypatch.setattr(sched_mod.shutil, "which", fake_which)
+
+        script = cron_env / "scripts" / "no_uv.py"
+        script.write_text("print('should not run')\n")
+
+        success, output = sched_mod._run_job_script("no_uv.py")
+        assert success is False
+        assert "uv was not found" in output
+
+    def test_offline_miss_retries_online_once(self, cron_env, monkeypatch):
+        """A cold env after `uv cache clean` retries online instead of failing."""
+        from cron import scheduler as sched_mod
+
+        real_which = sched_mod.shutil.which
+        monkeypatch.setattr(
+            sched_mod.shutil,
+            "which",
+            lambda name, *a, **k: "/usr/bin/uv" if name == "uv" else real_which(name, *a, **k),
+        )
+
+        script = cron_env / "scripts" / "cold.py"
+        script.write_text("print('x')\n")
+
+        calls = []
+
+        class Result:
+            def __init__(self, rc, out, err):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = err
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if "--offline" in argv:
+                return Result(1, "", "error: No solution found when resolving script dependencies")
+            return Result(0, "recovered", "")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = sched_mod._run_job_script("cold.py")
+        assert success is True
+        assert output == "recovered"
+        assert len(calls) == 2
+        assert "--offline" in calls[0]
+        assert "--offline" not in calls[1]

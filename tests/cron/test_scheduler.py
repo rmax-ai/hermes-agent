@@ -1949,7 +1949,11 @@ class TestSilentDelivery:
             save_mock.return_value = "/tmp/out.md"
             from cron.scheduler import tick
             tick(verbose=False)
-        save_mock.assert_called_once_with("monitor-job", "# full output")
+        saved = save_mock.call_args
+        assert saved[0][0] == "monitor-job"
+        assert saved[0][1].startswith("# full output")
+        # Local cost-footer patch: the archive always carries a cost section.
+        assert "## Cost" in saved[0][1]
         deliver_mock.assert_not_called()
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
@@ -2370,7 +2374,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job):
+        def mock_run_job(job, cost_capture=None):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
@@ -2404,7 +2408,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job):
+        def mock_run_job(job, cost_capture=None):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -2444,7 +2448,7 @@ class TestParallelTick:
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
         call_times = []
 
-        def mock_run_job(job):
+        def mock_run_job(job, cost_capture=None):
             import time
             call_times.append(("start", job["id"], time.monotonic()))
             time.sleep(0.05)

@@ -17,10 +17,26 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
+
+try:
+    from pydantic import BaseModel, ConfigDict
+except ImportError:
+    _ContextUsageFact = None
+else:
+    class _ContextUsageFact(BaseModel):
+        model_config = ConfigDict(strict=True, extra="ignore")
+
+        fact_id: int
+        content: str
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -29,6 +45,53 @@ from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_USAGE_MAX_IDS = 5
+_CONTEXT_USAGE_MAX_LINE_BYTES = 4096
+_CONTEXT_USAGE_MAX_FILE_BYTES = 1_048_576
+
+
+def _context_usage_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "memory-context-usage.jsonl"
+
+
+def _append_context_usage_receipt(receipt: dict) -> None:
+    import fcntl
+
+    path = _context_usage_path()
+    line = (
+        json.dumps(receipt, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        + b"\n"
+    )
+    if len(line) > _CONTEXT_USAGE_MAX_LINE_BYTES:
+        raise ValueError("memory context usage receipt exceeds the line cap")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size + len(line) > _CONTEXT_USAGE_MAX_FILE_BYTES:
+                keep_bytes = _CONTEXT_USAGE_MAX_FILE_BYTES - len(line)
+                start = max(0, size - keep_bytes)
+                handle.seek(start)
+                tail = handle.read(keep_bytes)
+                if start:
+                    first_newline = tail.find(b"\n")
+                    tail = tail[first_newline + 1 :] if first_newline >= 0 else b""
+                last_newline = tail.rfind(b"\n")
+                tail = tail[: last_newline + 1] if last_newline >= 0 else b""
+                handle.seek(0)
+                handle.truncate(0)
+                handle.write(tail)
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -208,16 +271,83 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
         try:
             results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
-            if not results:
-                return ""
-            lines = []
-            for r in results:
-                trust = r.get("trust_score", r.get("trust", 0))
-                lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
-            return "## Holographic Memory\n" + "\n".join(lines)
+            if results:
+                lines = []
+                for r in results:
+                    trust = r.get("trust_score", r.get("trust", 0))
+                    lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+                context_block = "## Holographic Memory\n" + "\n".join(lines)
+            else:
+                context_block = ""
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
+
+        try:
+            self._record_context_usage(results, eligible=True)
+        except Exception as e:
+            logger.debug("Holographic context usage accounting failed: %s", e)
+        return context_block
+
+    def _record_context_usage(self, results: list[dict], *, eligible: bool) -> None:
+        try:
+            store_ids = []
+            content_hashes = []
+            injected_bytes = 0
+            for result in results:
+                raw_content = result.get("content", "")
+                content = str(raw_content)
+                injected_bytes += len(content.encode("utf-8"))
+                fact_id = result.get("fact_id")
+                if _ContextUsageFact is not None:
+                    try:
+                        validated = _ContextUsageFact.model_validate(result)
+                    except Exception:
+                        logger.debug("Holographic context usage result validation failed")
+                    else:
+                        fact_id = validated.fact_id
+                        content = validated.content
+                elif not isinstance(raw_content, str):
+                    logger.debug("Holographic context usage result validation failed")
+                if (
+                    len(store_ids) < _CONTEXT_USAGE_MAX_IDS
+                    and type(fact_id) is int
+                    and fact_id > 0
+                ):
+                    store_ids.append(fact_id)
+                    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    content_hashes.append(f"sha256:{digest}")
+
+            receipt = {
+                "v": 1,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "context_id": uuid.uuid4().hex,
+                "eligible": bool(eligible),
+                "store_entry_ids": store_ids,
+                "store_content_hashes": content_hashes,
+                "injected_bytes": injected_bytes,
+            }
+        except Exception as e:
+            logger.debug("Holographic context usage receipt preparation failed: %s", e)
+            return
+
+        if store_ids and self._store:
+            try:
+                placeholders = ",".join("?" for _ in store_ids)
+                with self._store._lock:
+                    self._store._conn.execute(
+                        "UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                        f"WHERE fact_id IN ({placeholders})",
+                        store_ids,
+                    )
+                    self._store._conn.commit()
+            except Exception as e:
+                logger.debug("Holographic retrieval counter update failed: %s", e)
+
+        try:
+            _append_context_usage_receipt(receipt)
+        except Exception as e:
+            logger.debug("Holographic context usage receipt write failed: %s", e)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Holographic memory stores explicit facts via tools, not auto-sync.

@@ -242,6 +242,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # ids (e.g. via custom endpoints).
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
     "deepseek-v4-pro": 1_000_000,
+    "deepseek-flash": 1_000_000,  # V4.1 Flash — canonical id since 2026-09-10
     "deepseek-v4-flash": 1_000_000,
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,

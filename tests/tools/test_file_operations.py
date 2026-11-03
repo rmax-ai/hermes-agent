@@ -2,10 +2,11 @@
 
 import os
 import re
+import shutil
 import pytest
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tools.file_operations import (
     _is_write_denied,
@@ -14,6 +15,7 @@ from tools.file_operations import (
     PatchResult,
     SearchResult,
     SearchMatch,
+    ExecuteResult,
     LintResult,
     ShellFileOperations,
     MAX_LINE_LENGTH,
@@ -254,6 +256,7 @@ class TestSearchResult:
         d = r.to_dict()
         assert d["total_count"] == 0
         assert "matches" not in d
+        assert "scope_footer" not in d
 
     def test_to_dict_files_mode(self):
         r = SearchResult(files=["a.py", "b.py"], total_count=2)
@@ -700,6 +703,346 @@ class TestSearchFilesFallbackHiddenPaths:
 
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+
+
+class TestContentSearchExplicitHiddenRoot:
+    """Content search keeps explicit targets while matching both backends."""
+
+    def _make_env(self, cwd):
+        env = MagicMock()
+        env.cwd = str(cwd)
+
+        def execute(command, cwd=None, timeout=None, stdin_data=None):
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd or env.cwd,
+                text=True,
+                input=stdin_data,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return {
+                "output": completed.stdout + completed.stderr,
+                "returncode": completed.returncode,
+            }
+
+        env.execute = execute
+        return env
+
+    def _search(self, ops, backend, path, *, path_kind="directory",
+                output_mode="content"):
+        method = getattr(ops, f"_search_with_{backend}")
+        return method(
+            "needle",
+            str(path),
+            None,
+            50,
+            0,
+            output_mode,
+            0,
+            path_kind,
+        )
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_explicit_hidden_root_includes_visible_file_and_skips_nested_hidden(
+        self, tmp_path, backend
+    ):
+        if backend == "rg" and not shutil.which("rg"):
+            pytest.skip("ripgrep is not installed")
+        root = tmp_path / ".hidden-root"
+        root.mkdir()
+        visible = root / "ordinary.txt"
+        hidden = root / "nested" / ".secret" / "hidden.txt"
+        visible.write_text("needle visible\n")
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("needle hidden\n")
+
+        result = self._search(
+            ShellFileOperations(self._make_env(tmp_path)),
+            backend,
+            root,
+        )
+
+        assert result.error is None
+        assert [match.path for match in result.matches] == [str(visible)]
+        assert result.scope.backend == backend
+        assert result.scope.normalized_root == str(root)
+        assert result.scope.explicit_hidden_root is True
+        assert result.scope.skipped_nested_hidden == 1
+        assert "Searched explicit hidden root" in result.to_dict()["scope_footer"]
+        assert "skipped 1 nested-hidden" in result.to_dict()["scope_footer"]
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    @pytest.mark.parametrize("hidden", [False, True])
+    def test_explicit_file_is_searched_even_when_hidden_or_gitignored(
+        self, tmp_path, monkeypatch, backend, hidden
+    ):
+        if backend == "rg" and not shutil.which("rg"):
+            pytest.skip("ripgrep is not installed")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / ".gitignore").write_text("ignored.txt\n")
+        path = repo / (".hidden.txt" if hidden else "ignored.txt")
+        path.write_text("needle explicit file\n")
+
+        ops = ShellFileOperations(self._make_env(repo))
+        monkeypatch.setattr(
+            ops, "_has_command", lambda command: command == backend
+        )
+        result = ops.search("needle", path=str(path))
+
+        assert result.error is None
+        assert [match.path for match in result.matches] == [str(path)]
+        assert result.scope.explicit_file is True
+        assert result.scope.skipped_gitignored == 0
+        assert result.scope.skipped_nested_hidden == 0
+        assert "scope_footer" not in result.to_dict()
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_non_hidden_root_excludes_nested_hidden_descendants(
+        self, tmp_path, backend
+    ):
+        if backend == "rg" and not shutil.which("rg"):
+            pytest.skip("ripgrep is not installed")
+        root = tmp_path / "repo"
+        root.mkdir()
+        visible = root / "ordinary.txt"
+        hidden = root / ".secret" / "hidden.txt"
+        visible.write_text("needle visible\n")
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("needle hidden\n")
+
+        result = self._search(
+            ShellFileOperations(self._make_env(tmp_path)),
+            backend,
+            root,
+        )
+
+        assert result.error is None
+        assert [match.path for match in result.matches] == [str(visible)]
+        assert result.scope.backend == backend
+        assert result.scope.normalized_root == str(root)
+        assert result.scope.explicit_hidden_root is False
+        assert result.scope.skipped_nested_hidden == 1
+        assert "skipped 1 nested-hidden" in result.to_dict()["scope_footer"]
+
+    @pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep is not installed")
+    @pytest.mark.parametrize("output_mode", ["content", "files_only", "count"])
+    def test_rg_and_grep_agree_on_hidden_and_gitignored_candidates(
+        self, tmp_path, output_mode
+    ):
+        repo = tmp_path / "repo"
+        root = repo / ".hidden-root"
+        root.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / ".gitignore").write_text("ignored.txt\n")
+        visible = root / "visible.txt"
+        hidden = root / "nested" / ".hidden" / "hidden.txt"
+        ignored = root / "ignored.txt"
+        visible.write_text("needle visible\n")
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("needle nested hidden\n")
+        ignored.write_text("needle ignored\n")
+        ops = ShellFileOperations(self._make_env(tmp_path))
+
+        grep_result = self._search(
+            ops, "grep", root, output_mode=output_mode
+        )
+        rg_result = self._search(ops, "rg", root, output_mode=output_mode)
+
+        if output_mode == "content":
+            normalized = lambda result: {
+                str(Path(match.path).resolve()) for match in result.matches
+            }
+            assert normalized(grep_result) == normalized(rg_result) == {
+                str(visible.resolve())
+            }
+        elif output_mode == "files_only":
+            normalized = lambda result: {
+                str(Path(path).resolve()) for path in result.files
+            }
+            assert normalized(grep_result) == normalized(rg_result) == {
+                str(visible.resolve())
+            }
+        else:
+            assert {
+                str(Path(path).resolve()) for path in grep_result.counts
+            } == {
+                str(Path(path).resolve()) for path in rg_result.counts
+            } == {str(visible.resolve())}
+        assert (
+            grep_result.scope.skipped_nested_hidden,
+            grep_result.scope.skipped_gitignored,
+        ) == (
+            rg_result.scope.skipped_nested_hidden,
+            rg_result.scope.skipped_gitignored,
+        ) == (1, 1)
+        assert grep_result.to_dict()["scope_footer"] == rg_result.to_dict()["scope_footer"]
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_complete_no_match_is_silent(self, tmp_path, backend):
+        if backend == "rg" and not shutil.which("rg"):
+            pytest.skip("ripgrep is not installed")
+        root = tmp_path / "ordinary"
+        root.mkdir()
+        (root / "empty.txt").write_text("no matching text\n")
+
+        result = self._search(
+            ShellFileOperations(self._make_env(tmp_path)),
+            backend,
+            root,
+        )
+
+        assert result.error is None
+        assert result.total_count == 0
+        assert result.scope.incomplete_reason is None
+        assert "scope_footer" not in result.to_dict()
+
+    def test_missing_root_has_explicit_diagnostic_scope(self, tmp_path):
+        missing = tmp_path / ".missing-root"
+        result = ShellFileOperations(self._make_env(tmp_path)).search(
+            "needle", path=str(missing)
+        )
+
+        assert result.error is not None
+        assert "not found" in result.error.lower()
+        assert result.scope.incomplete_reason == "search root was not found"
+        assert "search completeness uncertain" in result.to_dict()["scope_footer"]
+
+    def test_public_search_dispatch_finds_content_in_hidden_root(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / ".hidden-root"
+        root.mkdir()
+        visible = root / "ordinary.txt"
+        visible.write_text("needle public search\n")
+        ops = ShellFileOperations(self._make_env(tmp_path))
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "grep")
+
+        result = ops.search("needle", path=str(root))
+
+        assert result.error is None
+        assert [match.path for match in result.matches] == [str(visible)]
+        assert result.scope.backend == "grep"
+        assert result.scope.explicit_hidden_root is True
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_backend_error_is_not_silently_empty(self, tmp_path, backend):
+        root = tmp_path / "ordinary"
+        root.mkdir()
+        ops = ShellFileOperations(self._make_env(tmp_path))
+        with patch.object(
+            ops,
+            "_exec",
+            return_value=ExecuteResult(
+                stdout=f"{backend}: permission denied\n", exit_code=2
+            ),
+        ):
+            result = getattr(ops, f"_search_with_{backend}")(
+                "needle", str(root), None, 50, 0, "content", 0
+            )
+
+        assert result.error is not None
+        assert "Search failed" in result.error
+        assert result.scope.incomplete_reason
+        assert "search completeness uncertain" in result.to_dict()["scope_footer"]
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_timeout_partial_results_include_completeness_warning(
+        self, tmp_path, backend
+    ):
+        root = tmp_path / "ordinary"
+        root.mkdir()
+        ops = ShellFileOperations(self._make_env(tmp_path))
+        with patch.object(
+            ops,
+            "_exec",
+            return_value=ExecuteResult(
+                stdout="[Command timed out after 60s]",
+                exit_code=124,
+            ),
+        ):
+            result = getattr(ops, f"_search_with_{backend}")(
+                "needle", str(root), None, 50, 0, "content", 0
+            )
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.limit_reason == "search_timeout"
+        assert "search completeness uncertain" in result.to_dict()["scope_footer"]
+
+    @pytest.mark.parametrize("backend", ["grep", "rg"])
+    def test_terminal_output_truncation_includes_completeness_warning(
+        self, tmp_path, backend
+    ):
+        root = tmp_path / "ordinary"
+        root.mkdir()
+        visible = root / "visible.txt"
+        visible.write_text("needle visible\n")
+        marker = (
+            "\n\n... [OUTPUT TRUNCATED - 10 chars omitted "
+            "out of 100000 total] ...\n\n"
+        )
+        ops = ShellFileOperations(self._make_env(tmp_path))
+        with patch.object(
+            ops,
+            "_exec",
+            return_value=ExecuteResult(
+                stdout=f"{visible}:1:needle visible{marker}",
+                exit_code=0,
+            ),
+        ):
+            result = getattr(ops, f"_search_with_{backend}")(
+                "needle", str(root), None, 50, 0, "content", 0
+            )
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.limit_reason == "search_output_truncated"
+        assert "search completeness uncertain" in result.to_dict()["scope_footer"]
+
+    def test_git_ignore_accounting_failure_is_explicit(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        visible = repo / "ignored.txt"
+        visible.write_text("needle ignored\n")
+        ops = ShellFileOperations(self._make_env(repo))
+        git_results = [
+            subprocess.CompletedProcess(
+                args=["git", "rev-parse"],
+                returncode=0,
+                stdout=(str(repo) + "\n").encode(),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=["git", "check-ignore"],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: cannot read ignore data",
+            ),
+        ]
+        with patch(
+            "tools.file_operations.subprocess.run",
+            side_effect=git_results,
+        ), patch.object(
+            ops,
+            "_exec",
+            return_value=ExecuteResult(
+                stdout=f"{visible}:1:needle ignored\n",
+                exit_code=0,
+            ),
+        ):
+            result = ops._search_with_grep(
+                "needle", str(repo), None, 50, 0, "content", 0
+            )
+
+        assert result.error == "Search failed: Git ignore accounting is unavailable"
+        assert not result.matches
+        assert result.scope.ignore_accounting_unavailable is True
+        assert "search completeness uncertain" in result.to_dict()["scope_footer"]
 
 
 class TestShellFileOpsWriteDenied:

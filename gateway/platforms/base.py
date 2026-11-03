@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import json
 import inspect
 import ipaddress
 import logging
@@ -482,7 +483,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
@@ -492,7 +493,8 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+from hermes_cli.config import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_dir
 
 
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
@@ -3424,6 +3426,50 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    def _capture_undelivered(
+        self,
+        chat_id,
+        content,
+        reply_to,
+        metadata,
+        error_str,
+        stage,
+    ) -> None:
+        """Best-effort durable capture for messages that could not be sent."""
+        try:
+            configured_path = os.environ.get("HERMES_UNDELIVERED_PATH")
+            path = Path(configured_path).expanduser() if configured_path else (
+                Path(get_hermes_home()) / "state" / "undelivered.jsonl"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            thread_id = None
+            if isinstance(metadata, dict):
+                thread_id = metadata.get("thread_id")
+                if thread_id is None:
+                    thread_id = metadata.get("message_thread_id")
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "platform": self.name,
+                "chat_id": str(chat_id),
+                "reply_to": reply_to,
+                "thread_id": str(thread_id) if thread_id is not None else None,
+                "metadata": metadata,
+                "content": content,
+                "error": str(error_str)[:500],
+                "stage": stage,
+            }
+            with open(path, "a", encoding="utf-8") as queue:
+                queue.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        except Exception as capture_err:
+            try:
+                logger.debug(
+                    "[%s] Could not capture undelivered message: %s",
+                    getattr(self, "name", "unknown"),
+                    capture_err,
+                )
+            except Exception:
+                pass
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -3506,6 +3552,9 @@ class BasePlatformAdapter(ABC):
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                self._capture_undelivered(
+                    chat_id, content, reply_to, metadata, error_str, "network_retries_exhausted"
+                )
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
@@ -3518,6 +3567,15 @@ class BasePlatformAdapter(ABC):
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
+            self._capture_undelivered(
+                chat_id,
+                content,
+                reply_to,
+                metadata,
+                fallback_result.error or error_str,
+                "plain_text_fallback_failed",
+            )
+            return fallback_result
         return fallback_result
 
     @staticmethod

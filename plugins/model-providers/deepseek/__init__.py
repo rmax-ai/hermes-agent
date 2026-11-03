@@ -13,8 +13,11 @@ Moonshot wire shape that DeepSeek's OpenAI-compat endpoint expects:
     {"reasoning_effort": "<low|medium|high|max>",
      "extra_body": {"thinking": {"type": "enabled" | "disabled"}}}
 
-Non-thinking models (only ``deepseek-chat`` today, which is V3) are left as
-no-ops so we don't perturb the V3 wire format.
+Non-thinking models: today that is ``deepseek-chat`` only. It is NOT a separate
+older model — it is the server-side NON-THINKING MODE of ``deepseek-flash``
+(V4.1 family): a live probe on 2026-10-09 requesting ``deepseek-chat`` returned
+``model: "deepseek-flash"`` with no ``reasoning_content``. It is left as a no-op
+so we do not perturb the non-thinking wire format.
 """
 
 from __future__ import annotations
@@ -29,12 +32,19 @@ def _model_supports_thinking(model: str | None) -> bool:
     """DeepSeek thinking-capable model families.
 
     Currently covers the V4 family (``deepseek-v4-pro``, ``deepseek-v4-flash``,
-    and any future ``deepseek-v4-*`` variants) and the legacy
-    ``deepseek-reasoner`` (R1).  ``deepseek-chat`` is V3 with no thinking mode.
+    and any future ``deepseek-v4-*`` variants), the V4.1 canonical id
+    ``deepseek-flash`` (since 2026-09-10), and the legacy
+    ``deepseek-reasoner`` (R1).  ``deepseek-chat`` carries no thinking mode: the
+    server serves it from the ``deepseek-flash`` model with thinking disabled
+    (probe-verified 2026-10-09 — the response echoes ``model: "deepseek-flash"``).
     """
     m = (model or "").strip().lower()
     if not m:
         return False
+    if m == "deepseek-flash":
+        # Canonical flash id (2026-09-10, V4.1 family) — thinking-capable,
+        # same wire shape as the V4 family.
+        return True
     if m.startswith("deepseek-v") and not m.startswith("deepseek-v3"):
         # deepseek-v4-*, deepseek-v5-*, etc. — every V4+ generation has
         # thinking. v3 explicitly excluded.
@@ -54,7 +64,8 @@ class DeepSeekProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
 
         if not _model_supports_thinking(model):
-            # V3 / unknown — leave wire format untouched, current behavior.
+            # Non-thinking (deepseek-chat) or an unknown id — leave the wire
+            # format untouched, current behavior.
             return extra_body, top_level
 
         # Determine enabled/disabled.  Default is enabled to match DeepSeek's

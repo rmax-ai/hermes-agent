@@ -510,6 +510,7 @@ class FactRetriever:
         sql = f"""
             SELECT f.*, facts_fts.rank as fts_rank_raw
             FROM facts_fts
+            JOIN (SELECT fact_id FROM recall_facts_v1) el ON el.fact_id = facts_fts.rowid
             JOIN facts f ON f.fact_id = facts_fts.rowid
             WHERE {where_sql}
             ORDER BY facts_fts.rank

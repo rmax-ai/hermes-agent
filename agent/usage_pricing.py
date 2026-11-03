@@ -383,11 +383,17 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "deepseek",
         "deepseek-chat",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        source="official_docs_snapshot",
+        # deepseek-chat = non-thinking mode of deepseek-v4-flash (server-side
+        # alias of the SAME model; the API echoes model=deepseek-flash —
+        # verified by direct probe 2026-10-07). Rates mirror the flash blended
+        # card pending empirical re-validation during the 2026-10-07
+        # comments-digest non-thinking A/B week.
+        input_cost_per_million=Decimal("0.225"),
+        output_cost_per_million=Decimal("0.9"),
+        cache_read_cost_per_million=Decimal("0.0045"),
+        source="user_override",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-03-16",
+        pricing_version="deepseek-chat-nonthinking-blend-2026-10-07",
     ),
     (
         "deepseek",
@@ -409,6 +415,35 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-05-12",
+    ),
+    (
+        "deepseek",
+        "deepseek-flash",
+    ): PricingEntry(
+        # V4.1-Flash card (effective 2026-09-10 04:00 UTC), blended across
+        # off-peak/peak (peak = 2x, weekday 01-04 & 06-10 UTC):
+        # off-peak 0.15/0.60/0.003, peak 0.30/1.20/0.006 -> blend avg.
+        # Drain re-validation 2026-09-12: flash billing is ACTIVE; the clean
+        # post-cutover day (Sep 10->11) reconciles with this blend at ~92%.
+        input_cost_per_million=Decimal("0.225"),
+        output_cost_per_million=Decimal("0.9"),
+        cache_read_cost_per_million=Decimal("0.0045"),
+        source="user_override",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-flash-blend-2026-09-12",
+    ),
+    (
+        "deepseek",
+        "deepseek-v4-flash",
+    ): PricingEntry(
+        # Legacy id, retired 2026-09-10; requests are served by V4.1-Flash
+        # and billed at the Flash price (per DeepSeek docs) — same blend.
+        input_cost_per_million=Decimal("0.225"),
+        output_cost_per_million=Decimal("0.9"),
+        cache_read_cost_per_million=Decimal("0.0045"),
+        source="user_override",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-flash-blend-2026-09-12",
     ),
     # Google Gemini
     (
@@ -722,6 +757,7 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    reasoning_tokens = 0
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
@@ -758,10 +794,13 @@ def normalize_usage(
                 getattr(response_usage, "cache_creation_input_tokens", 0)
             )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
+        reasoning_details = getattr(response_usage, "completion_tokens_details", None)
+        reasoning_tokens = _to_int(
+            getattr(reasoning_details, "reasoning_tokens", 0) if reasoning_details else 0
+        )
 
-    reasoning_tokens = 0
     output_details = getattr(response_usage, "output_tokens_details", None)
-    if output_details:
+    if not reasoning_tokens and output_details:
         reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
     return CanonicalUsage(
