@@ -21,7 +21,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -229,6 +231,91 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+
+_heartbeat_lock = threading.Lock()  # Never acquired by job workers.
+_heartbeat_pid = None
+_heartbeat_seq = 0
+_heartbeat_failures = 0
+
+
+def heartbeat_path() -> Path:
+    """Authoritative gateway control-pass progress, scoped to the active profile."""
+    return get_hermes_home() / "state" / "scheduler-heartbeat.json"
+
+
+def _process_start_id(pid: int) -> str | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    # comm (field 2) may contain spaces and parentheses; fields after it start at 3.
+    fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+    return str(int(fields[19]))  # field 22
+
+
+def _publish_heartbeat(due_count: int, provider: str) -> None:
+    """Best-effort, atomic publication only by the recorded gateway process."""
+    global _heartbeat_pid, _heartbeat_seq, _heartbeat_failures
+    if provider != "gateway" or not _heartbeat_lock.acquire(blocking=False):
+        return
+    temporary = None
+    try:
+        # Reuse the PID-record reader, without its stale-file cleanup or any
+        # process probes. Our own PID is necessarily alive; require start identity.
+        from gateway.status import _read_pid_record
+        pid = os.getpid()
+        record = _read_pid_record(get_hermes_home() / "gateway.pid") or {}
+        if type(record.get("pid")) is not int or record["pid"] != pid:
+            return
+        start_id = _process_start_id(pid)
+        if start_id is not None and (
+            type(record.get("start_time")) is not int
+            or str(record["start_time"]) != start_id
+        ):
+            return
+        if _heartbeat_pid != pid:
+            _heartbeat_pid, _heartbeat_seq = pid, 0
+        payload = {
+            "schema": 1,
+            "ts": time.time(),
+            "pid": pid,
+            "process_start_id": start_id,
+            "tick_seq": _heartbeat_seq + 1,
+            "due_count": due_count,
+            # len() is a single snapshot, with no job-held lock or iteration.
+            "in_flight_count": len(_running_job_ids),
+            "oldest_lease_age_s": None,
+            "provider": provider,
+        }
+        path = heartbeat_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".scheduler-heartbeat-",
+            delete=False,
+        ) as fh:
+            temporary = Path(fh.name)
+            json.dump(payload, fh, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+        _heartbeat_seq = payload["tick_seq"]
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        _heartbeat_failures = 0
+    except Exception as exc:
+        _heartbeat_failures += 1
+        if _heartbeat_failures % 60 == 1:
+            logger.warning("Scheduler heartbeat publication failed (%d failures): %s",
+                           _heartbeat_failures, exc)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _heartbeat_lock.release()
 
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
@@ -2788,7 +2875,8 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True,
+         provider: str | None = None) -> int:
     """
     Check and run all due jobs.
     
@@ -2799,6 +2887,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
+        provider: Caller label. Defaults to gateway for periodic async ticks,
+            manual for sync ticks. Only the recorded gateway may publish progress.
     
     Returns:
         Number of jobs executed (0 if another tick is already running)
@@ -2825,7 +2915,6 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
-            return 0
 
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
@@ -2959,6 +3048,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     logger.error("Cron job future failed: %s", exc)
                     _results.append(False)
             _sweep_mcp_orphans()
+            _publish_heartbeat(
+                len(due_jobs), provider if provider is not None else "manual",
+            )
             return sum(_results)
 
         # Async (gateway ticker) mode: don't block.  Sweep orphans via a
@@ -2978,6 +3070,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             # Nothing dispatched (all skipped / no due jobs) — sweep inline.
             _sweep_mcp_orphans()
 
+        _publish_heartbeat(len(due_jobs), provider if provider is not None else "gateway")
         return sum(_results)
     finally:
         if fcntl:
