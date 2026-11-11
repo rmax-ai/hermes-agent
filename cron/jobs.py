@@ -1221,6 +1221,15 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     _write_marker("ticker_heartbeat", str(time.time()), ".hb_")
     if success:
         _write_marker("ticker_last_success", str(time.time()), ".hb_")
+    try:
+        from gateway.scheduler_recovery import record_scheduler_heartbeat
+
+        record_scheduler_heartbeat(
+            _current_cron_store().cron_dir / "ticker_progress.json",
+            success=success,
+        )
+    except Exception:
+        logger.debug("Failed to record scheduler tick progress", exc_info=True)
 
 
 def _epoch_file_age(name: str) -> Optional[float]:

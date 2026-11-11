@@ -491,6 +491,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
     return {
         **_build_pid_record(), "gateway_state": "starting", "exit_reason": None,
         "restart_requested": False, "active_agents": 0, "platforms": {},
+        "gateway_banner": None, "scheduler_provider": None,
         "session_store": {"status": "unknown"}, "updated_at": _utc_now_iso(),
         **_get_code_identity_fields(),
     }
@@ -833,6 +834,7 @@ def write_runtime_status(
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     multiplex_standalone_reason: Any = _UNSET,
+    gateway_banner: Any = _UNSET, scheduler_provider: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
 ) -> None:
@@ -867,6 +869,9 @@ def write_runtime_status(
         ("served_profiles", served_profiles, lambda v: list(v or [])),
         # Why an unset-default (multiplex on) gateway is serving one profile; None clears it.
         ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
+        # Independent startup witness consumed by scheduler readiness and recovery.
+        ("gateway_banner", gateway_banner, lambda v: str(v).replace("\n", " ").strip()[:256] if v else None),
+        ("scheduler_provider", scheduler_provider, lambda v: str(v).strip()[:64] if v else None),
         ("session_store", session_store, _coerce_session_store),
     ))
     if platform is not _UNSET:
@@ -1299,8 +1304,9 @@ def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
     return home / _TAKEOVER_MARKER_FILENAME
 
 
-def _get_planned_stop_marker_path() -> Path:
-    return _get_process_hermes_home() / _PLANNED_STOP_MARKER_FILENAME
+def _get_planned_stop_marker_path(hermes_home: Optional[Path] = None) -> Path:
+    home = _canonical_hermes_home(hermes_home or _get_process_hermes_home())
+    return home / _PLANNED_STOP_MARKER_FILENAME
 
 
 def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
@@ -1604,6 +1610,21 @@ def planned_stop_marker_targets_self() -> bool:
     are still cleaned up; markers naming another PID are left alone."""
     parsed = _read_live_pid_marker(_get_planned_stop_marker_path(), _PLANNED_STOP_MARKER_TTL_S)
     return parsed is not None and _pid_marker_names_self(parsed[1], parsed[2])
+
+
+def planned_stop_marker_targets_process(
+    pid: int, start_time: Optional[int], *, hermes_home: Optional[Path] = None,
+) -> bool:
+    """Read-only probe for a live planned-stop marker targeting a process identity."""
+    parsed = _read_live_pid_marker(
+        _get_planned_stop_marker_path(hermes_home), _PLANNED_STOP_MARKER_TTL_S,
+    )
+    if parsed is None:
+        return False
+    _, target_pid, target_start_time = parsed
+    return target_pid == pid and (
+        target_start_time is None or start_time is None or target_start_time == start_time
+    )
 
 
 def get_running_pid(

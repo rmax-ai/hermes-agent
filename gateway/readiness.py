@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 from hermes_constants import get_hermes_home
+from gateway.scheduler_recovery import memory_readiness_check, scheduler_readiness
 
 
 _DISK_DEGRADED_PERCENT = 90.0
@@ -96,6 +97,8 @@ def collect_runtime_readiness(
         "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
+        "scheduler": scheduler_readiness(home, runtime),
+        "memory": memory_readiness_check(),
         "background_queues": _check(
             "ok", active_api_runs=max(0, int(active_api_runs)),
             process_completions=max(0, int(process_completion_queue_depth)),
