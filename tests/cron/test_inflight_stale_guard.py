@@ -1,72 +1,31 @@
-"""RED-first regression test for the cron in-flight claim leak (t_27b59583).
+"""Lease recovery must prove ownership, preserve cadence, and count suppressed slots."""
 
-The leak
---------
-``cron/scheduler.py`` tracks in-flight cron jobs in the module-level
-``_running_job_ids`` set. ``_submit_with_guard`` adds a job id BEFORE the
-future that owns its release exists: everything between the add and
-``pool.submit`` — ``create_execution``, ``contextvars.copy_context()``, and
-once running, the whole pre-future body of ``run_one_job`` (SessionDB
-construction around L3150-3161, agent import/build, config load) — has no
-``finally`` that discards the id. If any of it throws or hangs, the release
-path in ``_run_and_release``'s ``finally`` never runs. Every later tick then
-short-circuits with ``cron.scheduler: Job '<x>' already running — skipping``
-with no ``last_error``, no failure counter, and no alert, until the whole
-gateway process restarts (incident: jarvis ``board-pm-triage-*`` jobs,
-2026-08-02).
-
-This file is committed BEFORE the fix (red-first). Against the unfixed
-scheduler these tests MUST FAIL: the stale id is never released, so the
-primary assertion (``job_id not in get_running_job_ids()`` after a tick)
-fails. The implementation task (t_3778a491) makes them pass by adding the
-bounded stale-entry guard: on each tick, a claim older than
-``max(2 * interval, floor)`` with no live future is force-released, logged
-with a countable ``cron.inflight.forced_release`` signal, and surfaced via
-``mark_job_run(..., success=False, error=...)`` as ``last_error``.
-
-Design notes
-------------
-- The job store persists ``schedule`` as an already-parsed DICT
-  (``{"kind": "interval", "minutes": N}``), not the string form
-  ``parse_schedule`` consumes — the fixtures use the persisted dict shape.
-- The guard's age bookkeeping (``_running_since`` / ``_running_futures`` /
-  ``get_inflight_guard_stats``) does not exist yet on the unfixed scheduler.
-  The helpers reference it defensively (``getattr``/``hasattr``) so the SAME
-  file runs cleanly against both the red (unfixed) and the green (fixed)
-  implementation; the leak simulation is identical either way — an id in
-  ``_running_job_ids`` with no future ever installed.
-"""
-
+import concurrent.futures
+import threading
 import time
-from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
 import cron.scheduler as sched
+import cron.scheduler_inflight as inflight
 
 
 @pytest.fixture(autouse=True)
 def _clean_inflight():
-    """Reset the in-memory running set so tests are isolated.
-
-    Clears the guard bookkeeping defensively: on the unfixed scheduler only
-    ``_running_job_ids`` exists; the age/future dicts and counters appear
-    with the fix, and clearing them keeps the same file hermetic on both.
-    """
+    """Reset lease and finding state so tests are isolated."""
     sched._running_job_ids.clear()
-    for attr in ("_running_since", "_running_futures", "_forced_releases"):
-        obj = getattr(sched, attr, None)
-        if obj is not None:
-            obj.clear()
-    if hasattr(sched, "_forced_release_count"):
-        sched._forced_release_count = 0
+    sched._running_since.clear()
+    sched._running_futures.clear()
+    sched._running_leases.clear()
+    sched.reset_inflight_guard_stats()
+    inflight._current_lease_ids.set({})
     yield
     sched._running_job_ids.clear()
-    for attr in ("_running_since", "_running_futures", "_forced_releases"):
-        obj = getattr(sched, attr, None)
-        if obj is not None:
-            obj.clear()
+    sched._running_since.clear()
+    sched._running_futures.clear()
+    sched._running_leases.clear()
+    inflight._current_lease_ids.set({})
 
 
 def _job(job_id="wedged", minutes=60, kind="interval", cron_expr=None,
@@ -97,21 +56,25 @@ def _job(job_id="wedged", minutes=60, kind="interval", cron_expr=None,
     return job
 
 
-def _inject_stale_claim(job_id: str) -> None:
-    """Simulate the leak exactly as the incident left it: the job id is in
-    the running set but no future was ever installed, so the release path in
-    the worker's ``finally`` can never run.
+def _dead_thread() -> threading.Thread:
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    return thread
 
-    On the unfixed scheduler ``_running_job_ids`` is the only bookkeeping, so
-    this is precisely the shape of the real wedge. Once the bounded guard
-    lands it also records an old start time — 6h ago, far past
-    ``max(2 * 60m interval, 30m floor)`` — so the claim is past its
-    allowance on the first sweep.
-    """
-    sched._running_job_ids.add(job_id)
-    running_since = getattr(sched, "_running_since", None)
-    if running_since is not None:
-        running_since[job_id] = time.time() - 6 * 60 * 60  # 6h old
+
+def _inject_stale_claim(job_id: str, *, age_seconds: float = 6 * 60 * 60) -> str:
+    """Create a leaked pre-run lease whose exact owner thread has ended."""
+    assert sched.try_register_running_job(job_id)
+    lease = sched._running_leases[job_id]
+    lease.started_at = time.time() - age_seconds
+    lease.started_monotonic = time.monotonic() - age_seconds
+    lease.last_progress_at = lease.started_at
+    lease.last_progress_monotonic = lease.started_monotonic
+    lease.owner_thread = _dead_thread()
+    lease.owner_thread_ident = lease.owner_thread.ident
+    lease.owner_thread_name = lease.owner_thread.name
+    return lease.lease_id
 
 
 class TestStaleInflightLeak:
@@ -133,36 +96,22 @@ class TestStaleInflightLeak:
              patch.object(sched, "mark_job_run") as mark:
             sched.tick(verbose=False)
 
-        # RED: on the unfixed scheduler the tick never releases the id — it
-        # short-circuits with "already running — skipping" and the id stays
-        # in the set forever, so this assertion FAILS and proves the leak.
         assert job_id not in sched.get_running_job_ids()
+        mark.assert_not_called()
 
-        # GREEN (after the bounded guard): the release surfaces as a failure
-        # on the job row instead of silence…
-        assert mark.call_count == 1
-        args = mark.call_args.args
-        assert args[0] == job_id
-        assert args[1] is False
-        assert "in-flight" in args[2]
-
-        # …and emits the countable forced-release signal (log + probe stats).
+        # Recovery is visible without using jobs.json as lease authority.
         assert any(
             "cron.inflight.forced_release" in r.message for r in caplog.records
         )
         stats = sched.get_inflight_guard_stats()
         assert stats["forced_releases"] == 1
+        assert stats["oldest_lease_age_seconds"] is None
 
     def test_young_inflight_claim_is_not_force_released(self, tmp_path):
-        """Bound the guard: a claim younger than its allowance (and with no
-        future) is left alone — the sweep must not double-dispatch healthy
-        long-running jobs. Passes on both the red and the fixed code."""
+        """A live owner remains registered before its age allowance."""
         job = _job(job_id="young", minutes=60)
         job_id = job["id"]
-        sched._running_job_ids.add(job_id)
-        running_since = getattr(sched, "_running_since", None)
-        if running_since is not None:
-            running_since[job_id] = time.time() - 60  # 1 minute old
+        assert sched.try_register_running_job(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
              patch("cron.jobs.load_jobs", return_value=[job]), \
@@ -172,6 +121,24 @@ class TestStaleInflightLeak:
 
         assert job_id in sched.get_running_job_ids()
         mark.assert_not_called()
+
+
+def test_only_the_registered_owner_thread_can_normally_release():
+    job_id = "owner-thread-release"
+    assert sched.try_register_running_job(job_id)
+    lease_id = sched.get_running_job_lease_id(job_id)
+    released = []
+    worker = threading.Thread(
+        target=lambda: released.append(
+            sched.release_running_job(job_id, lease_id=lease_id)
+        )
+    )
+    worker.start()
+    worker.join()
+
+    assert released == [False]
+    assert job_id in sched.get_running_job_ids()
+    assert sched.release_running_job(job_id, lease_id=lease_id)
 
 
 class TestJobIntervalMinutes:
@@ -212,8 +179,7 @@ class TestStaleInflightSweep:
     def test_allowance_is_at_least_two_intervals(self, tmp_path):
         """A slow-but-healthy 6h job is not clipped by the 30m floor."""
         job = _job(minutes=360)
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 4 * 60 * 60  # 4h < 12h
+        _inject_stale_claim(job["id"], age_seconds=4 * 60 * 60)  # 4h < 12h
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == []
@@ -223,8 +189,7 @@ class TestStaleInflightSweep:
         """The real guide-curator row (4320m) gets a 144h allowance, not the
         30m floor — the Blocker-1 regression against the live store shape."""
         job = _job(job_id="guide-curator", minutes=4320)
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 4 * 60 * 60  # 4h ≪ 144h
+        _inject_stale_claim(job["id"], age_seconds=4 * 60 * 60)  # 4h ≪ 144h
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == []
@@ -234,53 +199,51 @@ class TestStaleInflightSweep:
         """A weekly cron job (cadence 10080m) is not clipped at 30m: a 24h
         claim is still healthy (allowance 20160m)."""
         job = _job(job_id="weekly", kind="cron", cron_expr="0 9 * * 1")
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 24 * 60 * 60
+        _inject_stale_claim(job["id"], age_seconds=24 * 60 * 60)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == []
         assert job["id"] in sched.get_running_job_ids()
 
     def test_live_future_is_never_released(self, tmp_path):
-        """A claim with a genuinely executing future is left alone even when
-        old — the sweep must not double-dispatch healthy long-running jobs."""
-        import concurrent.futures
-
+        """A live future is retained; its terminal state releases the exact lease."""
         job = _job()
         fut: concurrent.futures.Future = concurrent.futures.Future()
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 10 * 60 * 60
-        sched._running_futures[job["id"]] = fut
+        assert sched.try_register_running_job(job["id"], dispatching=True)
+        lease = sched._running_leases[job["id"]]
+        lease.started_monotonic -= 10 * 60 * 60
+        lease.started_at -= 10 * 60 * 60
+        assert sched.bind_running_job_future(job["id"], lease.lease_id, fut)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == []
         assert job["id"] in sched.get_running_job_ids()
         fut.set_result(True)
 
-        # Once the future is done but the id somehow survived, it IS stale.
-        with patch.object(sched, "mark_job_run"), \
-             patch.object(sched, "_get_hermes_home", return_value=tmp_path):
+        # A terminal future is exact owner evidence, not an age-based guess.
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == [job["id"]]
+        assert sched.get_inflight_guard_stats()["forced_releases"] == 1
 
-    def test_pending_sentinel_released_when_submit_hung(self, tmp_path):
-        """A claim whose submit path hung stays _FUTURE_PENDING past its
-        allowance (the SessionDB-init wedge class) and must be released."""
-        job = _job()
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 5 * 60 * 60
-        sched._running_futures[job["id"]] = sched._FUTURE_PENDING
+    def test_old_pending_sentinel_is_not_released_by_age(self, tmp_path):
+        """A stale pending submit with a live owner is retained and reported."""
+        job = _job(job_id="pending-old")
+        assert sched.try_register_running_job(job["id"], dispatching=True)
+        lease = sched._running_leases[job["id"]]
+        lease.started_monotonic -= 5 * 60 * 60
+        lease.started_at -= 5 * 60 * 60
 
-        with patch.object(sched, "mark_job_run") as mark, \
-             patch.object(sched, "_get_hermes_home", return_value=tmp_path):
-            assert sched.sweep_stale_inflight([job]) == [job["id"]]
-        assert mark.call_count == 1
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+        finding = sched.get_inflight_guard_stats()["recent_findings"][-1]
+        assert finding["owner_state"] == "active"
+        assert finding["decision"] == "retain"
 
     def test_pending_sentinel_young_claim_is_not_released(self, tmp_path):
         """A young pending claim (submit still in flight) is safe."""
         job = _job()
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 60  # 1 minute
-        sched._running_futures[job["id"]] = sched._FUTURE_PENDING
+        assert sched.try_register_running_job(job["id"], dispatching=True)
 
         with patch.object(sched, "mark_job_run") as mark, \
              patch.object(sched, "_get_hermes_home", return_value=tmp_path):
@@ -289,11 +252,9 @@ class TestStaleInflightSweep:
         mark.assert_not_called()
 
     def test_finite_repeat_job_released_without_mark_job_run(self, tmp_path):
-        """A forced release must not consume a finite repeat budget or
-        auto-delete the row; the claim is released, the row untouched."""
+        """Recovery does not write job configuration or consume repeat budget."""
         job = _job(repeat={"times": 1, "completed": 0})
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 5 * 60 * 60
+        _inject_stale_claim(job["id"], age_seconds=5 * 60 * 60)
 
         with patch.object(sched, "mark_job_run") as mark, \
              patch.object(sched, "_get_hermes_home", return_value=tmp_path):
@@ -302,26 +263,23 @@ class TestStaleInflightSweep:
         mark.assert_not_called()
         assert sched.get_inflight_guard_stats()["forced_releases"] == 1
 
-    def test_claim_without_timestamp_is_adopted_then_swept(self, tmp_path):
-        """An id injected with no recorded start (pre-guard claim) must not be
-        released immediately, but must become sweepable."""
-        job = _job()
-        sched._running_job_ids.add(job["id"])
-
-        with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
-            assert sched.sweep_stale_inflight([job]) == []
-            assert job["id"] in sched._running_since
-            sched._running_since[job["id"]] -= 5 * 60 * 60
-            with patch.object(sched, "mark_job_run"):
-                assert sched.sweep_stale_inflight([job]) == [job["id"]]
-
-    def test_forced_release_logs_a_warning(self, tmp_path, caplog):
+    def test_legacy_claim_without_owner_is_reported_not_released(self, tmp_path):
+        """A legacy id without owner identity fails closed even when old."""
         job = _job()
         sched._running_job_ids.add(job["id"])
         sched._running_since[job["id"]] = time.time() - 5 * 60 * 60
 
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+        findings = sched.get_inflight_guard_stats()["recent_findings"]
+        assert findings[-1]["reason"] == "owner-identity-unavailable"
+
+    def test_forced_release_logs_a_warning(self, tmp_path, caplog):
+        job = _job()
+        _inject_stale_claim(job["id"], age_seconds=5 * 60 * 60)
+
         with caplog.at_level("WARNING"), \
-             patch.object(sched, "mark_job_run"), \
              patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             sched.sweep_stale_inflight([job])
 
@@ -330,11 +288,10 @@ class TestStaleInflightSweep:
 
 class TestWedgedJobRefiresWithoutRestart:
     def test_tick_sweeps_then_dispatches_the_previously_wedged_job(self, tmp_path):
-        """End-to-end symptom: before the fix, tick() returned 0 forever."""
+        """A proven pre-run owner loss releases before the next due dispatch."""
         job = dict(_job(), enabled=True, next_run_at="2020-01-01T00:00:00",
                    deliver="local")
-        sched._running_job_ids.add(job["id"])
-        sched._running_since[job["id"]] = time.time() - 6 * 60 * 60
+        _inject_stale_claim(job["id"])
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
              patch.object(sched, "get_due_jobs", return_value=[job]), \
@@ -352,162 +309,215 @@ class TestWedgedJobRefiresWithoutRestart:
 
 
 class TestLedgerTerminalReconciliation:
-    """Persisted-state recovery path (t_8b5480b3).
-
-    The age-only sweep released claims older than ``max(2 * interval, floor)``,
-    but a leaked claim could be YOUNG (inside its allowance) while the durable
-    executions ledger already proved the last run ended — e.g. the 2026-08-14
-    recurring-router wedge, which survived a gateway restart because the age
-    bound alone could not see a run the ledger had already finished.  This
-    class tests the ledger reconciliation: an in-memory claim whose job's
-    MOST RECENT execution row is terminal (completed/failed/unknown) is stale
-    by construction and is force-released regardless of in-memory age, so the
-    recurring job re-dispatches on the next tick without force-run/resume.
-
-    RED first: on the age-only sweep (main before this change) a young leaked
-    claim with a terminal ledger row is NOT released — it stays wedged.  With
-    the ledger reconciliation it IS released (and, because a terminal ledger
-    row is authoritative, WITHOUT a synthetic mark_job_run failure).
-
-    Race guard (salvage follow-up): the terminal row must belong to THIS
-    claim — ``claimed_at >= _running_since[job_id]``.  A terminal row OLDER
-    than the in-memory claim is the PREVIOUS run's outcome (the normal state
-    for a recurring job between try_register_running_job and
-    create_execution, or while the worker's finally block hasn't released
-    yet) and must never force-release a healthy fresh claim.
-    """
+    def _inject_claim(
+        self,
+        job_id: str,
+        *,
+        run_id: str = "exec-current",
+        age_seconds: float = 60,
+    ):
+        assert sched.try_register_running_job(job_id)
+        lease = sched._running_leases[job_id]
+        lease.run_id = run_id
+        lease.owner_task_id = run_id
+        lease.started_at = time.time() - age_seconds
+        lease.started_monotonic = time.monotonic() - age_seconds
+        lease.owner_thread = _dead_thread()
+        lease.owner_thread_ident = lease.owner_thread.ident
+        lease.owner_thread_name = lease.owner_thread.name
+        return lease
 
     @staticmethod
-    def _row_at(offset_seconds: float) -> str:
-        """ISO claimed_at at now+offset (aware, local tz)."""
-        return datetime.fromtimestamp(
-            time.time() + offset_seconds, tz=timezone.utc
-        ).isoformat()
+    def _row(lease, status: str) -> dict:
+        return {
+            "id": lease.run_id,
+            "job_id": lease.job_id,
+            "process_id": lease.owner_process_id,
+            "pid": lease.owner_pid,
+            "process_started_at": lease.owner_process_started_at,
+            "status": status,
+            "handoff_pending": 0,
+            "scheduled_instant": lease.scheduled_occurrence,
+        }
 
-    def _inject_young_claim(self, job_id: str) -> None:
-        """Claim is YOUNG (inside the 30m floor) so only the ledger-terminal
-        path, never the age path, can release it."""
-        sched._running_job_ids.add(job_id)
-        if hasattr(sched, "_running_since"):
-            sched._running_since[job_id] = time.time() - 60  # 1 minute old
-
-    def test_young_claim_with_terminal_ledger_row_is_released(self, tmp_path):
-        """RED/GREEN: a terminal ledger row from THIS claim's run proves the
-        run ended, so a young leaked claim must be force-released even though
-        its in-memory age is inside the allowance (the age-only sweep alone
-        would leave it)."""
+    def test_exact_terminal_run_is_released_once_by_cas(self, tmp_path):
         job = _job(job_id="ledger-terminal", minutes=10)
-        job_id = job["id"]
-        self._inject_young_claim(job_id)
+        lease = self._inject_claim(job["id"], age_seconds=60)
+        row = self._row(lease, "failed")
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
-                 job_id: {"status": "failed", "id": "exec-x",
-                          "claimed_at": self._row_at(-30)},  # after claim (-60)
-             }), \
-             patch.object(sched, "mark_job_run") as mark:
-            released = sched.sweep_stale_inflight([job])
+             patch("cron.executions.get_execution", return_value=row):
+            assert sched.sweep_stale_inflight([job]) == [job["id"]]
+            assert sched.sweep_stale_inflight([job]) == []
 
-        # RED on the age-only sweep: the young claim is NOT released.  GREEN
-        # with the ledger reconciliation: it IS released.
-        assert job_id in released, "terminal ledger row must force-release the claim"
-        assert job_id not in sched.get_running_job_ids()
-        # Ledger-terminal is authoritative: no synthetic failure written.
+        assert job["id"] not in sched.get_running_job_ids()
+        assert sched.get_inflight_guard_stats()["forced_releases"] == 1
+        assert sched.try_register_running_job(job["id"])
+        new_lease_id = sched.get_running_job_lease_id(job["id"])
+        assert new_lease_id != lease.lease_id
+        assert not sched.release_running_job(job["id"], lease_id=lease.lease_id)
+        assert sched.get_running_job_lease_id(job["id"]) == new_lease_id
+
+    def test_previous_run_terminal_row_does_not_release_new_lease(self, tmp_path):
+        job = _job(job_id="prev-run-terminal", minutes=10)
+        lease = self._inject_claim(job["id"])
+        row = self._row(lease, "completed")
+        row["id"] = "exec-previous"
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=row):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+
+    def test_terminal_row_from_different_owner_is_not_released(self, tmp_path):
+        job = _job(job_id="different-owner", minutes=10)
+        lease = self._inject_claim(job["id"], age_seconds=5 * 60 * 60)
+        row = self._row(lease, "completed")
+        row["process_id"] = "different-process"
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=row):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+        assert sched.get_inflight_guard_stats()["recent_findings"][-1]["reason"] == (
+            "execution-owner-mismatch"
+        )
+
+    def test_adopted_worker_owner_is_bound_before_terminal_recovery(self, tmp_path):
+        job = _job(job_id="adopted-owner", minutes=10)
+        assert sched.try_register_running_job(job["id"])
+        lease_id = sched.get_running_job_lease_id(job["id"])
+        lease = sched._running_leases[job["id"]]
+        run_id = "exec-adopted"
+        assert sched.bind_running_job_execution(job["id"], run_id)
+        adopted = self._row(lease, "running")
+        adopted.update({
+            "process_id": "external-worker-process",
+            "pid": 4242,
+            "process_started_at": 9876,
+        })
+        assert inflight.bind_running_job_execution_owner(
+            job["id"], lease_id, run_id, adopted, expected_pid=4242)
+        assert lease.owner_process_id == "external-worker-process"
+        assert lease.owner_pid == 4242
+
+        lease.owner_thread = _dead_thread()
+        lease.owner_thread_ident = lease.owner_thread.ident
+        terminal = {**adopted, "status": "completed"}
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=terminal):
+            assert sched.sweep_stale_inflight([job]) == [job["id"]]
+
+
+    def test_malformed_database_row_fails_closed(self, tmp_path):
+        job = _job(job_id="malformed-row", minutes=10)
+        lease = self._inject_claim(job["id"], age_seconds=5 * 60 * 60)
+        malformed = self._row(lease, "completed")
+        malformed.pop("process_id")
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=malformed):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+        assert sched.get_inflight_guard_stats()["recent_findings"][-1]["reason"] == (
+            "execution-row-invalid"
+        )
+
+    def test_missing_and_nonterminal_rows_fail_closed(self, tmp_path):
+        job = _job(job_id="uncertain-row", minutes=10)
+        lease = self._inject_claim(job["id"], age_seconds=5 * 60 * 60)
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=None):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+
+        row = self._row(lease, "running")
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=row):
+            assert sched.sweep_stale_inflight([job]) == []
+        assert job["id"] in sched.get_running_job_ids()
+
+    def test_unstarted_absent_owner_can_be_recovered_without_job_store_write(self, tmp_path):
+        job = _job(job_id="owner-absent", minutes=10)
+        lease = self._inject_claim(job["id"], age_seconds=5 * 60 * 60)
+        row = self._row(lease, "claimed")
+        terminal = {**row, "status": "failed"}
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.get_execution", return_value=row), \
+             patch(
+                 "cron.executions.finish_unstarted_execution",
+                 return_value=terminal,
+             ) as finish, \
+             patch.object(sched, "mark_job_run") as mark:
+            assert sched.sweep_stale_inflight([job]) == [job["id"]]
+        finish.assert_called_once()
         mark.assert_not_called()
 
-    def test_terminal_row_from_previous_run_does_not_release_fresh_claim(self, tmp_path):
-        """RACE GUARD: a terminal row OLDER than the in-memory claim is the
-        PREVIOUS run's outcome — the fresh claim (e.g. in the window between
-        try_register_running_job and create_execution, or a finished run whose
-        worker finally hasn't run) must NOT be force-released; releasing it
-        would double-dispatch the job."""
-        job = _job(job_id="prev-run-terminal", minutes=10)
-        job_id = job["id"]
-        self._inject_young_claim(job_id)
+    def test_lost_unstarted_execution_cas_does_not_release_lease(self, tmp_path):
+        job = _job(job_id="handoff-race", minutes=10)
+        lease = self._inject_claim(job["id"], age_seconds=5 * 60 * 60)
+        claimed = self._row(lease, "claimed")
+        handed_off = {**claimed, "handoff_pending": 1}
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
-                 job_id: {"status": "completed", "id": "exec-prev",
-                          "claimed_at": self._row_at(-600)},  # before claim (-60)
-             }), \
-             patch.object(sched, "mark_job_run"):
-            released = sched.sweep_stale_inflight([job])
+             patch(
+                 "cron.executions.get_execution",
+                 side_effect=[claimed, handed_off],
+             ), \
+             patch(
+                 "cron.executions.finish_unstarted_execution",
+                 return_value=None,
+             ) as finish:
+            assert sched.sweep_stale_inflight([job]) == []
 
-        assert job_id not in released, (
-            "previous run's terminal row must not release a fresh claim"
+        finish.assert_called_once()
+        assert job["id"] in sched.get_running_job_ids()
+        assert sched.get_inflight_guard_stats()["recent_findings"][-1]["reason"] == (
+            "execution-terminal-cas-lost"
         )
-        assert job_id in sched.get_running_job_ids()
 
-    def test_terminal_row_without_claimed_at_fails_closed(self, tmp_path):
-        """A terminal row with no parseable claimed_at cannot be attributed to
-        this claim — the ledger path must fail closed and leave the claim to
-        the age bound."""
-        job = _job(job_id="no-claimed-at", minutes=10)
-        job_id = job["id"]
-        self._inject_young_claim(job_id)
 
-        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
-                 job_id: {"status": "failed", "id": "exec-x"},
-             }), \
-             patch.object(sched, "mark_job_run"):
-            released = sched.sweep_stale_inflight([job])
+def test_two_suppressed_occurrences_are_cadence_normalized_and_bounded():
+    job_id = "suppressed-job"
+    job = _job(job_id=job_id, minutes=10)
+    assert sched.try_register_running_job(
+        job_id,
+        scheduled_occurrence="2026-11-10T10:00:00+00:00",
+        cadence_seconds=600,
+    )
+    first = {**job, "_scheduled_instant": "2026-11-10T10:00:00+00:00"}
+    second = {**job, "_scheduled_instant": "2026-11-10T10:10:00+00:00"}
 
-        assert job_id not in released
-        assert job_id in sched.get_running_job_ids()
+    assert sched.note_already_running_skip(first) == 1
+    assert sched.note_already_running_skip(first) == 1
+    assert sched.note_already_running_skip(second) == 2
+    stats = sched.get_inflight_guard_stats()
+    assert stats["suppressed_occurrences_by_job"][job_id] == 2
+    assert stats["leases"][0]["scheduled_occurrence"] == (
+        "2026-11-10T10:00:00+00:00"
+    )
+    assert stats["oldest_lease_job_id"] == job_id
+    assert stats["oldest_lease_age_seconds"] >= 0
+    assert stats["leases"][0]["owner_thread_id"] == threading.current_thread().ident
+    finding = stats["recent_findings"][-1]
+    assert finding["event"] == "repeated_suppression"
+    assert finding["normalized_suppression_count"] == 2
+    assert finding["cadence_seconds"] == 600
 
-    def test_young_claim_without_ledger_row_is_not_released(self, tmp_path):
-        """A young claim whose job has NO execution row at all (the claim was
-        taken but create_execution never ran) is left to the age bound — the
-        ledger reconciliation must not release claims it cannot prove ended."""
-        job = _job(job_id="no-ledger-row", minutes=10)
-        job_id = job["id"]
-        self._inject_young_claim(job_id)
 
-        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={}), \
-             patch.object(sched, "mark_job_run"):
-            released = sched.sweep_stale_inflight([job])
+def test_finding_history_is_bounded():
+    for index in range(inflight._MAX_RECENT_FINDINGS + 3):
+        job_id = f"bounded-{index}"
+        assert sched.try_register_running_job(job_id, cadence_seconds=60)
+        job = _job(job_id=job_id, minutes=1)
+        sched.note_already_running_skip(
+            {**job, "_scheduled_instant": "2026-11-10T10:00:00+00:00"})
+        sched.note_already_running_skip(
+            {**job, "_scheduled_instant": "2026-11-10T10:01:00+00:00"})
+        assert sched.release_running_job(job_id)
 
-        assert job_id not in released
-        assert job_id in sched.get_running_job_ids()
-
-    def test_young_claim_with_running_ledger_row_is_not_released(self, tmp_path):
-        """A young claim whose job is genuinely still running per the ledger
-        ('claimed'/'running' row) is never released — reconciliation must not
-        double-dispatch a healthy long-running job."""
-        job = _job(job_id="still-running", minutes=10)
-        job_id = job["id"]
-        self._inject_young_claim(job_id)
-
-        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
-                 job_id: {"status": "running", "id": "exec-y"},
-             }), \
-             patch.object(sched, "mark_job_run"):
-            released = sched.sweep_stale_inflight([job])
-
-        assert job_id not in released
-        assert job_id in sched.get_running_job_ids()
-
-    def test_old_claim_with_terminal_ledger_row_still_released_once(self, tmp_path):
-        """An old claim with a terminal ledger row is released by the ledger
-        path (one release) — it must not double-release or double-count."""
-        job = _job(job_id="old-terminal", minutes=10)
-        job_id = job["id"]
-        sched._running_job_ids.add(job_id)
-        if hasattr(sched, "_running_since"):
-            sched._running_since[job_id] = time.time() - 6 * 60 * 60  # 6h old
-
-        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
-                 job_id: {"status": "completed", "id": "exec-z",
-                          "claimed_at": self._row_at(-3 * 60 * 60)},  # after claim (-6h)
-             }), \
-             patch.object(sched, "mark_job_run") as mark:
-            released = sched.sweep_stale_inflight([job])
-
-        assert job_id in released
-        assert job_id not in sched.get_running_job_ids()
-        assert sched.get_inflight_guard_stats()["forced_releases"] == 1
-        mark.assert_not_called()  # authoritative ledger row, no synthetic failure
+    assert len(sched.get_inflight_guard_stats()["recent_findings"]) == (
+        inflight._MAX_RECENT_FINDINGS
+    )

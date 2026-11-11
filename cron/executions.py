@@ -269,6 +269,39 @@ def finish_execution(
     return record
 
 
+def finish_unstarted_execution(
+    execution_id: str,
+    *,
+    job_id: str,
+    process_id: str,
+    pid: int,
+    process_started_at: Optional[int],
+    scheduled_instant: Optional[str],
+    error: str,
+) -> Optional[Dict[str, Any]]:
+    """CAS-close only an unhanded claimed attempt still owned by this process."""
+    if process_id != _PROCESS_ID or pid != os.getpid():
+        return None
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET status='failed', finished_at=?, error=?, handoff_pending=0,
+                   handoff_started_at=NULL
+               WHERE id=? AND job_id=? AND status='claimed' AND handoff_pending=0
+                 AND process_id=? AND pid=? AND process_started_at IS ?
+                 AND scheduled_instant IS ?""",
+            (now, str(error), str(execution_id), str(job_id), process_id, pid,
+             process_started_at, scheduled_instant),
+        )
+        if cur.rowcount != 1:
+            return None
+        _prune_unlocked(conn)
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
+    return record
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()
