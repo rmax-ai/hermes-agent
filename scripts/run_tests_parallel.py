@@ -264,6 +264,7 @@ def _discover_files(roots: List[Path]) -> List[Path]:
 
 
 _ProcessIdentity = tuple[int, tuple[str, str | float]]
+_DIRECT_CHILD_KILL_WAIT = 5.0  # bounded reap for the identity-unavailable fallback
 
 
 def _process_start_identity(pid: int) -> tuple[str, str | float] | None:
@@ -313,6 +314,26 @@ def _process_identity_matches(
     return _process_start_identity(expected[0]) == expected[1]
 
 
+def _kill_direct_child(proc: "subprocess.Popen") -> None:
+    """Terminate exactly the child we spawned through its Popen handle.
+
+    Used when PID/start identity capture was unavailable: the process group
+    cannot be revalidated in that case, so signalling it could hit an unrelated
+    group after PID reuse. The Popen handle itself is still ours.
+    """
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        return
+    wait = getattr(proc, "wait", None)
+    if wait is None:
+        return
+    try:
+        wait(timeout=_DIRECT_CHILD_KILL_WAIT)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _kill_tree(
     proc: "subprocess.Popen",
     pgid: int | None = None,
@@ -342,7 +363,9 @@ def _kill_tree(
     The timeout watchdog sets ``revalidate_identity``: the captured PID/start
     pair must still match, and POSIX verifies the owned pgid before signalling
     the group. If the group was not captured, only the validated child is
-    signalled.
+    signalled. When identity capture is unavailable, the watchdog terminates
+    only the direct Popen child through its handle. No process group is ever
+    signalled without a validated identity.
 
     Why not use psutil to kill the tree: it walks the parent-child tree, but
     in the happy path the root has already been reaped so
@@ -354,8 +377,14 @@ def _kill_tree(
     if proc.pid is None:
         return
 
-    if revalidate_identity and not _process_identity_matches(proc, expected_identity):
-        return
+    if revalidate_identity:
+        if expected_identity is None:
+            # Identity capture unavailable: no group signal is safe, but the
+            # direct child handle is ours. Never fall through to killpg here.
+            _kill_direct_child(proc)
+            return
+        if not _process_identity_matches(proc, expected_identity):
+            return
 
     if sys.platform == "win32":
         try:

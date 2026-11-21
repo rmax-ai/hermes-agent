@@ -1,4 +1,7 @@
-"""Regression coverage for the per-file pytest process watchdog."""
+"""Regression coverage for the per-file pytest process watchdog.
+
+Includes the forced-None identity-unavailable fallback regression.
+"""
 
 from __future__ import annotations
 
@@ -331,3 +334,55 @@ def test_stale_identity_is_not_signalled_and_results_keep_summary_contract(
     assert result.returncode == 1, result.stdout
     assert "=== Summary: 2 files, 1 tests passed, 1 failed" in result.stdout
     assert "fail-output-marker" in result.stdout
+
+
+@pytest.mark.linux_only
+def test_identity_unavailable_terminates_direct_child_and_spares_unrelated_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    target = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        target_start_ticks = _linux_start_ticks(target.pid)
+        assert target_start_ticks is not None
+        pgid = os.getpgid(target.pid)
+        monkeypatch.setattr(runner, "_process_start_identity", lambda _pid: None)
+        assert runner._capture_process_identity(target) is None
+
+        started = time.monotonic()
+        runner._kill_tree(
+            target,
+            pgid=pgid,
+            expected_identity=None,
+            revalidate_identity=True,
+        )
+        wall = time.monotonic() - started
+
+        assert wall < 10, f"direct-child termination exceeded bound: {wall:.2f}s"
+        assert target.poll() is not None
+        assert not _pid_is_running(target.pid, target_start_ticks), (
+            "identity-unavailable fallback left the target child running"
+        )
+        assert unrelated.poll() is None, "identity-unavailable fallback killed unrelated process"
+    finally:
+        for proc in (target, unrelated):
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+            try:
+                proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
