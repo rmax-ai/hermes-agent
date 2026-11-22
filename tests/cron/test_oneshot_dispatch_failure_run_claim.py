@@ -1,16 +1,17 @@
-"""Regression tests for #86522 — one-shot run_claim cleared on dispatch failure.
+"""Regression tests for #86522 — one-shot run_claim handling on dispatch failure.
 
 ``get_due_jobs`` stamps a ``run_claim`` on one-shot jobs before returning them
 as due (#59229); ``mark_job_run`` clears it on completion.  When dispatch
 itself fails (interpreter shutdown, execution-creation error, executor submit
-error) the job never reaches ``mark_job_run`` and the stale claim blocked
-re-dispatch until the TTL expired (default 30 min) — a precisely-timed
-one-shot reminder arrived up to 30 minutes late with no error surfaced.
+error) a known pre-submit failure can clear it so the next healthy tick can
+retry.  A ``submit`` exception is different: the executor may have queued the
+worker before raising, so the claim and lease must stay fenced until that
+worker's outcome is known.
 
 The fix (salvaged from PR #87591 by @RelaxJonh) adds
 ``cron.jobs.clear_run_claim`` and calls it on all three ``_submit_with_guard``
-early-exit paths, wrapped best-effort so a failing store can never crash the
-tick these paths exist to protect.
+pre-submit early-exit paths, wrapped best-effort so a failing store can never
+crash the tick these paths exist to protect.
 """
 from __future__ import annotations
 
@@ -75,9 +76,8 @@ class TestClearRunClaim:
         assert clear_run_claim("no-such-job") is False
 
 
-class TestDispatchFailurePathsClearClaim:
-    """Each _submit_with_guard early-exit must clear the one-shot claim so the
-    next healthy tick re-dispatches instead of waiting out the 30-min TTL."""
+class TestDispatchFailurePaths:
+    """Known pre-submit failures clear; ambiguous handoffs remain fenced."""
 
     def _tick_one(self, job):
         from cron import scheduler as sched
@@ -103,19 +103,41 @@ class TestDispatchFailurePathsClearClaim:
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
 
-    def test_submit_failure_clears_claim(self, cron_store):
+    def test_submit_failure_retains_claim_when_handoff_is_ambiguous(self, cron_store):
         from cron import scheduler as sched
+        from cron.executions import get_execution
         job = _make_oneshot(claimed=True)
 
-        class _ExplodingPool:
-            def submit(self, *a, **k):
+        class _AmbiguousPool:
+            submitted = None
+
+            def submit(self, callable_, *args, **kwargs):
+                self.submitted = (callable_, args, kwargs)
                 raise RuntimeError("cannot schedule new futures")
 
-        pool = _ExplodingPool()
-        with patch.object(sched, "_get_parallel_pool", return_value=pool):
+        pool = _AmbiguousPool()
+
+        def _complete_claimed_attempt(dispatched_job, *_args, **_kwargs):
+            return sched.finish_execution(
+                dispatched_job["execution_id"], success=True)
+
+        with patch.object(sched, "_get_parallel_pool", return_value=pool), \
+             patch.object(sched, "_process_due_job", side_effect=_complete_claimed_attempt):
             self._tick_one(job)
+
         reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
-        assert reloaded.get("run_claim") is None
+        attempt = sched.get_inflight_guard_stats()["leases"][0]["run_id"]
+        assert reloaded.get("run_claim") is not None
+        assert job["id"] in sched.get_running_job_ids()
+        assert attempt is not None
+        assert get_execution(attempt)["status"] == "claimed"
+        assert not sched.try_register_running_job(job["id"])
+
+        assert pool.submitted is not None
+        callable_, args, kwargs = pool.submitted
+        with patch.object(sched, "_process_due_job", side_effect=_complete_claimed_attempt):
+            callable_(*args, **kwargs)
+        assert get_execution(attempt)["status"] == "completed"
         assert job["id"] not in sched.get_running_job_ids()
 
     def test_clear_failure_is_best_effort_not_fatal(self, cron_store):

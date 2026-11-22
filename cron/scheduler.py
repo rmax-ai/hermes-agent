@@ -513,7 +513,6 @@ def _is_cron_silence_response(text: str) -> bool:
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
-_running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
 # Shutdown must not misclassify these as ownerless in-process runs: the tool
@@ -522,24 +521,18 @@ _restart_safe_waiter_job_ids: set[str] = set()
 # job_id -> pid of the restart-safe external worker executing it (absent for in-process runs), so a
 # drain observer can name the process holding the gateway open.
 _running_worker_pids: dict[str, int] = {}
-_running_lock = threading.Lock()
 
-# Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
-# until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
-_running_since: dict = {}
-_running_futures: dict = {}
-
-# Installed in ``_running_futures`` at claim time so a sweep landing before ``pool.submit`` returns
-# never sees ``missing`` and releases a claim about to get its future.
-_FUTURE_PENDING = object()
-
-# Forced-release count/history for ``get_inflight_guard_stats()``; mirrored to JSONL for probes.
-_forced_release_count: int = 0
-_forced_releases: list = []
-_FORCED_RELEASE_HISTORY = 20
-
-# Stale-allowance floor (minutes); per-job allowance is max(2 * interval, this).
-_INFLIGHT_MIN_ALLOWANCE_MINUTES = 30.0
+from cron.scheduler_inflight import (
+    _FUTURE_PENDING, _INFLIGHT_MIN_ALLOWANCE_MINUTES, _running_futures,
+    _running_job_ids, _running_leases, _running_lock, _running_since,
+    bind_running_job_execution, bind_running_job_execution_owner,
+    bind_running_job_future, bind_running_job_worker,
+    get_inflight_guard_stats, get_running_job_details, get_running_job_ids,
+    get_running_job_lease_id, note_already_running_skip,
+    note_running_job_submission_ambiguous, release_running_job,
+    reset_inflight_guard_stats, sweep_stale_inflight, touch_running_job,
+    try_register_running_job, _job_interval_minutes, _inflight_min_allowance_minutes,
+)
 
 
 # Execution tokens (``_running_fire_owners`` identity keys) force-interrupted at shutdown; see
@@ -576,300 +569,6 @@ class _CombinedCancelEvent:
     def set(self) -> None:
         for event in self._events:
             event.set()
-
-
-def get_running_job_ids() -> "frozenset[str]":
-    """Thread-safe snapshot of executing job IDs (dispatch until ``_process_job`` returns). Read by
-    the gateway shutdown drain, otherwise blind to cron work (runs outside ``_running_agents``).
-
-    _drain_active_agents``) reads this to treat in-flight cron work as active the same way it already treats
-    in-flight chat sessions via ``_running_agents`` — cron jobs run through their own thread pool here,
-    entirely outside that dict, so without this the drain is structurally blind to them (#60432).
-    """
-    with _running_lock:
-        return frozenset(_running_job_ids | _running_fire_owners.keys())
-
-
-def get_running_job_details() -> list[dict]:
-    """Per in-flight job: ``{"job_id", "elapsed_s", "worker_pid"}`` (``worker_pid`` None for in-process
-    runs). The drain wait publishes this so ``hermes update`` can say WHICH job it is waiting on."""
-    now = time.time()
-    with _running_lock:
-        return [
-            {"job_id": jid, "elapsed_s": round(now - _running_since[jid], 1) if jid in _running_since else None,
-             "worker_pid": _running_worker_pids.get(jid)}
-            for jid in sorted(_running_job_ids | _running_fire_owners.keys())
-        ]
-
-
-def try_register_running_job(job_id: str) -> bool:
-    """Atomically add ``job_id`` to the in-flight set; False (caller must skip) if already mid-run.
-    Single dedupe owner for ticker + manual runs (the fire claim's 300s TTL is outlived by real
-    jobs). Callers MUST pair success with ``release_running_job`` in a ``finally``.
-
-    This is the single dedupe owner shared by the ticker's ``_submit_with_guard`` and manual runs
-    (``tools/cronjob_tools``): the fire claim alone cannot prevent a double-fire because its TTL (300s) is
-    routinely outlived by real jobs, after which a manual ``cronjob(action='run')`` would claim successfully
-    and run the same job concurrently (idea from #53395 by @izumi0uu).
-    Registration also makes the run visible to ``get_running_job_ids`` (the gateway shutdown drain, #60432)
-    and ``mark_running_jobs_interrupted``.
-    """
-    from hermes_cli.backend_retirement import retirement
-
-    with retirement.work() as admitted, _running_lock:
-        if not admitted or job_id in _running_job_ids:
-            return False
-        _running_job_ids.add(job_id)
-        # Same critical section as the add: no window where an in-flight id lacks an age the sweep
-        # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
-        _running_since[job_id] = time.time()
-        _running_futures[job_id] = _FUTURE_PENDING
-        return True
-
-
-def release_running_job(job_id: str) -> None:
-    """Remove ``job_id`` from the in-flight running set (idempotent)."""
-    with _running_lock:
-        _running_job_ids.discard(job_id)
-        _running_since.pop(job_id, None)
-        _running_futures.pop(job_id, None)
-        _running_worker_pids.pop(job_id, None)
-
-
-def _inflight_min_allowance_minutes() -> float:
-    """Stale allowance floor (min): ``cron.inflight_max_minutes``, else env escape hatch/default."""
-    with contextlib.suppress(Exception):
-        _ucfg = load_config() or {}
-        _cfg_val = (
-            _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-        ).get("inflight_max_minutes")
-        if _cfg_val is not None:
-            val = float(_cfg_val)
-            if val > 0:
-                return val
-    raw = cron_env_setting("HERMES_CRON_INFLIGHT_MAX_MINUTES").strip()
-    if raw:
-        try:
-            val = float(raw)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid HERMES_CRON_INFLIGHT_MAX_MINUTES=%r; using default %s",
-                raw,
-                _INFLIGHT_MIN_ALLOWANCE_MINUTES)
-    return _INFLIGHT_MIN_ALLOWANCE_MINUTES
-
-
-# expr -> minutes; cadence never changes, so avoid re-evaluating croniter every tick.
-_cron_interval_cache: dict = {}
-
-
-def _cron_interval_minutes(expr: str) -> Optional[float]:
-    """Cron expression cadence (gap between next two fires) in minutes; None -> floor allowance."""
-    if expr in _cron_interval_cache:
-        return _cron_interval_cache[expr]
-    result = None
-    with contextlib.suppress(Exception):
-        from cron.jobs import _ensure_croniter
-
-        if _ensure_croniter():
-            from cron.jobs import croniter as _croniter
-            from datetime import datetime
-
-            base = datetime.now()
-            it = _croniter(expr, base)
-            first = it.get_next(datetime)
-            second = it.get_next(datetime)
-            gap = (second - first).total_seconds() / 60.0
-            result = gap if gap > 0 else None
-    _cron_interval_cache[expr] = result
-    return result
-
-
-def _job_interval_minutes(job: dict) -> Optional[float]:
-    """Best-effort job interval in minutes (None if unknown / one-shot -> floor). ``schedule`` is
-    persisted as a parsed dict; the string path is only a fallback for programmatic callers."""
-    with contextlib.suppress(Exception):
-        schedule = job.get("schedule")
-        if isinstance(schedule, str) and schedule.strip():
-            from cron.jobs import parse_schedule
-
-            schedule = parse_schedule(schedule) or {}
-        if isinstance(schedule, dict):
-            kind = schedule.get("kind")
-            if kind == "interval":
-                minutes = schedule.get("minutes")
-                return float(minutes) if minutes else None
-            if kind == "cron":
-                return _cron_interval_minutes(str(schedule.get("expr") or ""))
-    return None
-
-
-def get_inflight_guard_stats() -> dict:
-    """Probe-visible snapshot; non-zero ``forced_releases`` means a job wedged and was recovered."""
-    now = time.time()
-    with _running_lock:
-        return {
-            "running": sorted(_running_job_ids),
-            "running_ages_seconds": {
-                jid: round(now - started, 1)
-                for jid, started in _running_since.items()
-            },
-            "forced_releases": _forced_release_count,
-            "recent_forced_releases": list(_forced_releases)}
-
-
-def _record_forced_release(job_id: str, name: str, age_seconds: float, allowance_seconds: float) -> None:
-    """Persist a countable signal for one forced release (best-effort)."""
-    entry = {
-        "job_id": job_id,
-        "name": name,
-        "age_seconds": round(age_seconds, 1),
-        "allowance_seconds": round(allowance_seconds, 1),
-        "at": _hermes_now().isoformat()}
-    with _running_lock:
-        _forced_releases.append(entry)
-        del _forced_releases[:-_FORCED_RELEASE_HISTORY]
-    try:
-        path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
-        _ensure_cron_dir(path.parent)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
-    except Exception as e:  # never let telemetry break a tick
-        logger.debug("Could not append forced-release record: %s", e)
-
-
-def _latest_executions_for_releasable_claims() -> dict:
-    """Latest durable execution per releasable-looking claim (missing/pending/done future), one
-    indexed query so the healthy path pays no DB work. Snapshot under _running_lock — iterating
-    the set while try_register/release mutate it raises RuntimeError."""
-    with _running_lock:
-        claim_futures = {job_id: _running_futures.get(job_id) for job_id in _running_job_ids}
-    candidates = [
-        job_id for job_id, fut in claim_futures.items()
-        if fut is None or fut is _FUTURE_PENDING or fut.done()
-    ]
-    if not candidates:
-        return {}
-    try:
-        from cron.executions import latest_executions as _latest_execs
-        return _latest_execs(candidates)
-    except Exception:
-        return {}
-
-
-def _row_belongs_to_claim(row: dict, claim_started: float) -> bool:
-    """True when the ledger row was claimed at/after this in-memory claim. An older terminal row is
-    the PREVIOUS run's (try_register->create_execution window); releasing on it would
-    double-dispatch. Unparseable timestamps fail closed (the age path still bounds the claim)."""
-    claimed_at = row.get("claimed_at")
-    if not claimed_at:
-        return False
-    try:
-        from cron.jobs import _ensure_aware as _ensure_aware_ts
-        row_ts = _ensure_aware_ts(datetime.fromisoformat(claimed_at))
-        return row_ts.timestamp() >= claim_started
-    except (ValueError, TypeError, OSError):
-        return False
-
-
-def _record_stale_release(job: dict, job_id: str, age: float, allowance: float, fut, reason: str) -> None:
-    """WARNING log + probe record for one forced release, then ``last_error`` unless the ledger
-    already holds the run's real outcome or the job has a finite repeat budget."""
-    name = job.get("name") or job_id
-    future_state = "pending" if fut is _FUTURE_PENDING else "missing" if fut is None else "finished"
-    logger.warning(
-        "cron.inflight.forced_release event=forced_release reason=%s job='%s' "
-        "id=%s age=%.0fs allowance=%.0fs future=%s — stale in-flight claim "
-        "released; the job was skipping every fire with 'already running'",
-        reason, name, job_id, age, allowance, future_state)
-    _record_forced_release(job_id, name, age, allowance)
-    # Ledger already records how the run ended: mark_job_run here would clobber an honest
-    # ok status with a synthetic failure or double-write a failure.
-    if reason == "ledger-terminal":
-        return
-    # Age release may lack a ledger row, so last_error is how it surfaces. But a forced release
-    # is NOT a real run: never consume a finite repeat budget or let mark_job_run auto-delete.
-    repeat = job.get("repeat") or {}
-    if isinstance(repeat, dict) and repeat.get("times") is not None:
-        logger.warning(
-            "cron.inflight.forced_release.job_untouched job='%s' id=%s — "
-            "finite-repeat job released without mark_job_run (repeat budget "
-            "preserved); row left in place so it re-fires normally",
-            name, job_id)
-        return
-    try:
-        mark_job_run(
-            job_id, False,
-            f"Stale in-flight claim force-released after {age / 60:.1f}m "
-            f"(allowance {allowance / 60:.1f}m); previous run never released "
-            f"the scheduler in-flight guard")
-    except Exception as e:
-        logger.warning("Could not record forced release for job %s: %s", job_id, e)
-
-
-def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
-    """Force-release in-flight claims that can no longer be making progress; returns released ids.
-
-    Stale = older than ``max(2 * interval, floor)`` AND (no live future — submit path hung before
-    ``pool.submit`` returned — or finished without discarding the id) — or the claim's OWN ledger
-    row is terminal regardless of age. Each release logs WARNING ``event=forced_release``, bumps
-    the probe counter, mirrors JSONL, and writes ``last_error``.
-    """
-    global _forced_release_count
-
-    by_id = {j.get("id"): j for j in (due_jobs or []) if isinstance(j, dict)}
-    floor_seconds = _inflight_min_allowance_minutes() * 60.0
-    now = time.time()
-    stale: list = []
-    from cron.executions import _TERMINAL_STATES as _terminal_states
-
-    _latest = _latest_executions_for_releasable_claims()
-    # Compute intervals OUTSIDE _running_lock so croniter doesn't block try_register/release.
-    _intervals = {jid: _job_interval_minutes(j) for jid, j in by_id.items()}
-
-    with _running_lock:
-        for job_id in list(_running_job_ids):
-            started = _running_since.get(job_id)
-            if started is None:
-                # Claim predates this guard — adopt it; sweepable one allowance from now.
-                _running_since[job_id] = now
-                continue
-            age = now - started
-            interval_minutes = _intervals.get(job_id)
-            allowance = floor_seconds
-            if interval_minutes:
-                allowance = max(allowance, 2.0 * interval_minutes * 60.0)
-            fut = _running_futures.get(job_id)
-            if fut is _FUTURE_PENDING:
-                # Submit path hung before ``pool.submit`` returned — the wedge class; release it.
-                pass
-            elif fut is not None and not fut.done():
-                continue  # genuinely still executing
-            # Ledger reconciliation: a terminal row belonging to THIS claim proves it stale even
-            # inside its age allowance. Row must be this claim's, else a recurring job's previous
-            # run would double-dispatch a fresh claim.
-            latest = _latest.get(job_id)
-            if (
-                latest is not None
-                and latest.get("status") in _terminal_states
-                and _row_belongs_to_claim(latest, started)
-            ):
-                reason = "ledger-terminal"
-            elif age >= allowance:
-                reason = "age"
-            else:
-                continue
-            _running_job_ids.discard(job_id)
-            _running_since.pop(job_id, None)
-            _running_futures.pop(job_id, None)
-            _forced_release_count += 1
-            stale.append((job_id, age, allowance, fut, reason))
-
-    for job_id, age, allowance, fut, _reason in stale:
-        _record_stale_release(by_id.get(job_id) or {}, job_id, age, allowance, fut, _reason)
-    return [s[0] for s in stale]
 
 
 def mark_running_jobs_interrupted(
@@ -2466,6 +2165,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         logger.warning("Job '%s': fire claim ownership was already lost before execution", job_id)
         _finish_unstarted("Fire claim ownership lost before execution started.")
         return True
+    touch_running_job(job_id, str(job.get("execution_id") or ""))
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
@@ -2480,6 +2180,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     if stop.wait(_FIRE_CLAIM_MISS_CONFIRM_SECONDS) or heartbeat_fire_claim(
                             job_id, expected_owner=owner):
                         last_confirmed = time.monotonic()
+                        touch_running_job(job_id, str(job.get("execution_id") or ""))
                         continue
                     lost_ownership.set()
                     logger.warning(
@@ -2487,6 +2188,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         job_id)
                     return
                 last_confirmed = time.monotonic()
+                touch_running_job(job_id, str(job.get("execution_id") or ""))
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
                 if (
@@ -2534,6 +2236,12 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    cadence = _job_interval_minutes(job)
+    bind_running_job_execution(
+        job["id"], execution_id,
+        scheduled_occurrence=job.get("_scheduled_instant"),
+        cadence_seconds=cadence * 60.0 if cadence else None,
+    )
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
@@ -3419,6 +3127,34 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 acknowledgement.get("pid"),
                 execution_id,
             )
+            acknowledged_pid = acknowledgement.get("pid")
+            lease_id = get_running_job_lease_id(job_id)
+            if (
+                lease_id
+                and isinstance(acknowledged_pid, int)
+                and not isinstance(acknowledged_pid, bool)
+            ):
+                try:
+                    owner_row = get_execution(execution_id)
+                    if not bind_running_job_execution_owner(
+                        job_id,
+                        lease_id,
+                        execution_id,
+                        owner_row,
+                        expected_pid=acknowledged_pid,
+                    ):
+                        logger.warning(
+                            "Cron execution %s acknowledged by pid %s, but its exact "
+                            "owner identity could not be bound to the in-flight lease",
+                            execution_id,
+                            acknowledged_pid,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Could not read the adopted owner for cron execution %s",
+                        execution_id,
+                        exc_info=True,
+                    )
             with _running_lock, contextlib.suppress(TypeError, ValueError):
                 _running_worker_pids[job_id] = int(acknowledgement.get("pid") or process.pid)
             return _wait_for_external_cron_worker(
@@ -3774,15 +3510,19 @@ def _maybe_reap_dead_owners() -> None:
 
 
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:
-    """Bound the in-flight set BEFORE the dedup guard so a leaked claim is force-released now
-    rather than eating every later fire until restart. Skipped when nothing is in flight."""
-    if not _running_job_ids:
-        return
+    """Reconcile leases before dedup, releasing only terminal or provably absent owners.
+
+    Ambiguous owners stay fenced and produce a bounded finding rather than risking a duplicate
+    side-effecting run. Skipped when nothing is in flight.
+    """
+    with _running_lock:
+        if not _running_job_ids:
+            return
+        inflight_ids = set(_running_job_ids)
     _sweep_jobs = due_jobs
     with contextlib.suppress(Exception):
-        _inflight_ids = set(_running_job_ids)
         _due_ids = {j.get("id") for j in due_jobs if isinstance(j, dict)}
-        if not _inflight_ids <= _due_ids:
+        if not inflight_ids <= _due_ids:
             from cron.jobs import load_jobs as _load_all_jobs
 
             _sweep_jobs = _load_all_jobs()
@@ -3835,7 +3575,7 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
 
 def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
-    Running-set membership is released in the worker's finally."""
+    The accepted worker releases in its finally; an unreturned submit result stays fenced."""
     job_id = job["id"]
     job_label = job.get("name", job_id)
 
@@ -3878,46 +3618,104 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _not_dispatched_shutdown()
         _clear_run_claim_best_effort()
         return None
-    if not try_register_running_job(job_id):
+    cadence = _job_interval_minutes(job)
+    if not try_register_running_job(
+        job_id,
+        scheduled_occurrence=job.get("_scheduled_instant"),
+        cadence_seconds=cadence * 60.0 if cadence else None,
+        dispatching=True,
+    ):
+        note_already_running_skip(job)
         logger.info("Job '%s' already running — skipping", job_label)
         return None
-    # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
+    lease_id = get_running_job_lease_id(job_id)
+    execution = None
+    handed_off = False
+    submission_uncertain = False
+    dispatch_stage = "execution creation"
     try:
         execution = create_execution(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
         dispatched_job = dict(job, execution_id=execution["id"])
+        if not bind_running_job_execution(
+            job_id,
+            execution["id"],
+            scheduled_occurrence=job.get("_scheduled_instant"),
+            cadence_seconds=cadence * 60.0 if cadence else None,
+            lease_id=lease_id,
+        ):
+            raise RuntimeError("Cron in-flight lease changed before executor submission")
         _ctx = contextvars.copy_context()
-    except Exception as execution_err:
-        # Release the claim so the next tick retries instead of wedging "already running".
-        release_running_job(job_id)
-        _clear_run_claim_best_effort()
-        logger.exception(
-            "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
-        return None
 
-    def _run_and_release(j=dispatched_job, ctx=_ctx):
-        try:
-            return ctx.run(process_job, j)
-        finally:
-            release_running_job(j["id"])
+        def _run_and_release(j=dispatched_job, ctx=_ctx, token=lease_id):
+            try:
+                if not bind_running_job_worker(j["id"], token, j["execution_id"]):
+                    finish_execution(
+                        j["execution_id"],
+                        success=False,
+                        error="Cron in-flight lease changed before the worker started.",
+                    )
+                    return False
+                return ctx.run(process_job, j)
+            finally:
+                release_running_job(j["id"], lease_id=token)
 
-    try:
+        dispatch_stage = "executor submission"
         fut = pool.submit(_run_and_release)
-    except Exception as submit_err:
-        release_running_job(job_id)
-        _clear_run_claim_best_effort()
-        finish_execution(
-            execution["id"], success=False, error=f"Executor dispatch failed: {submit_err}")
-        if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
-            _not_dispatched_shutdown()
+        handed_off = True
+        dispatch_stage = "future binding"
+        bind_running_job_future(job_id, lease_id, fut)
+        return fut
+    except BaseException as dispatch_err:
+        submission_uncertain = dispatch_stage == "executor submission"
+        if submission_uncertain:
+            note_running_job_submission_ambiguous(job_id, lease_id)
+            logger.warning(
+                "Job '%s': executor submission outcome is unknown; retaining "
+                "in-flight lease to prevent a duplicate run: %s",
+                job_label,
+                dispatch_err,
+            )
+        elif handed_off:
+            logger.warning(
+                "Job '%s': executor accepted the run but its future could not be "
+                "bound; retaining the in-flight lease: %s",
+                job_label,
+                dispatch_err,
+            )
         else:
-            logger.error("Job '%s' not dispatched: %s", job_label, submit_err)
-        return None
-
-    with _running_lock:
-        if job_id in _running_job_ids:
-            _running_futures[job_id] = fut
-    return fut
+            _clear_run_claim_best_effort()
+        if execution is not None and not submission_uncertain and not handed_off:
+            try:
+                finish_execution(
+                    execution["id"],
+                    success=False,
+                    error=f"Executor dispatch failed: {dispatch_err}",
+                )
+            except Exception:
+                logger.warning(
+                    "Could not close cron execution %s after dispatch failure",
+                    execution.get("id"),
+                    exc_info=True)
+        if dispatch_stage == "execution creation":
+            logger.error(
+                "Job '%s' not dispatched: execution creation failed: %s",
+                job_label, dispatch_err, exc_info=isinstance(dispatch_err, Exception))
+        elif (
+            not submission_uncertain
+            and not handed_off
+            and isinstance(dispatch_err, RuntimeError)
+            and _interpreter_shutting_down(dispatch_err)
+        ):
+            _not_dispatched_shutdown()
+        elif not submission_uncertain and not handed_off:
+            logger.error("Job '%s' not dispatched: %s", job_label, dispatch_err)
+        if isinstance(dispatch_err, Exception):
+            return None
+        raise
+    finally:
+        if not handed_off and not submission_uncertain and lease_id is not None:
+            release_running_job(job_id, lease_id=lease_id)
 
 
 def _sweep_mcp_orphans_when_all_done(futures: list) -> None:

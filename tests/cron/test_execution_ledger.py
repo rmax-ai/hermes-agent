@@ -135,6 +135,71 @@ def test_foreign_process_cannot_start_or_finish_execution(monkeypatch, tmp_path)
     assert executions.finish_execution(record["id"], success=True) is not None
 
 
+def test_unstarted_recovery_cas_requires_exact_owner_and_no_handoff(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    occurrence = "2026-11-10T10:00:00+00:00"
+    unstarted = executions.create_execution(
+        "recover-unstarted", source="builtin", scheduled_instant=occurrence)
+
+    wrong_identity = executions.finish_unstarted_execution(
+        unstarted["id"],
+        job_id="another-job",
+        process_id=unstarted["process_id"],
+        pid=unstarted["pid"],
+        process_started_at=unstarted["process_started_at"],
+        scheduled_instant=occurrence,
+        error="must not match another job",
+    )
+    assert wrong_identity is None
+    wrong_occurrence = executions.finish_unstarted_execution(
+        unstarted["id"],
+        job_id=unstarted["job_id"],
+        process_id=unstarted["process_id"],
+        pid=unstarted["pid"],
+        process_started_at=unstarted["process_started_at"],
+        scheduled_instant="2026-11-10T10:10:00+00:00",
+        error="must not match another occurrence",
+    )
+    assert wrong_occurrence is None
+
+    terminal = executions.finish_unstarted_execution(
+        unstarted["id"],
+        job_id=unstarted["job_id"],
+        process_id=unstarted["process_id"],
+        pid=unstarted["pid"],
+        process_started_at=unstarted["process_started_at"],
+        scheduled_instant=occurrence,
+        error="owner ended before start",
+    )
+    assert terminal["status"] == "failed"
+    assert executions.finish_unstarted_execution(
+        unstarted["id"],
+        job_id=unstarted["job_id"],
+        process_id=unstarted["process_id"],
+        pid=unstarted["pid"],
+        process_started_at=unstarted["process_started_at"],
+        scheduled_instant=unstarted["scheduled_instant"],
+        error="late recovery",
+    ) is None
+
+    handing_off = executions.create_execution("recover-handoff", source="builtin")
+    assert executions.mark_execution_handoff_pending(handing_off["id"]) is not None
+    assert executions.finish_unstarted_execution(
+        handing_off["id"],
+        job_id=handing_off["job_id"],
+        process_id=handing_off["process_id"],
+        pid=handing_off["pid"],
+        process_started_at=handing_off["process_started_at"],
+        scheduled_instant=handing_off["scheduled_instant"],
+        error="must not overtake handoff",
+    ) is None
+    current = executions.get_execution(handing_off["id"])
+    assert current["status"] == "claimed"
+    assert current["handoff_pending"] == 1
+
+
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
     import cron.executions as executions
 
@@ -297,14 +362,18 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
-def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
+def test_submit_exception_keeps_unknown_handoff_fenced(monkeypatch):
     import cron.scheduler as scheduler
 
-    class BrokenPool:
-        def submit(self, _callable):
-            raise ValueError("executor rejected")
+    class AmbiguousPool:
+        submitted = None
+
+        def submit(self, callable_):
+            self.submitted = callable_
+            raise OSError(11, "executor submit result is unknown")
 
     finished = []
+    side_effects = []
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
@@ -314,16 +383,33 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
-    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
-    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
+    monkeypatch.setattr(
+        scheduler, "claim_job_for_fire", lambda _job_id, **_kwargs: True)
+    pool = AmbiguousPool()
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: pool)
+
+    def run_once(job, **_kwargs):
+        side_effects.append(job["execution_id"])
+        scheduler.finish_execution(job["execution_id"], success=True)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run_once)
 
     assert scheduler.tick(verbose=False, sync=False) == 0
-    assert finished == [
-        ("exec-submit-fail", {
-            "success": False,
-            "error": "Executor dispatch failed: executor rejected",
-        })
-    ]
+    assert pool.submitted is not None
+    assert side_effects == []
+    assert finished == []
+    assert "submit-fail" in scheduler.get_running_job_ids()
+    assert not scheduler.try_register_running_job("submit-fail")
+    finding = scheduler.get_inflight_guard_stats()["recent_findings"][-1]
+    assert finding["reason"] == "submit-result-unknown"
+    assert finding["decision"] == "retain"
+
+    # The executor may have queued the callable before submit raised. It still
+    # owns the same lease, and its finally releases only after completion.
+    pool.submitted()
+    assert side_effects == ["exec-submit-fail"]
+    assert finished == [("exec-submit-fail", {"success": True})]
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
