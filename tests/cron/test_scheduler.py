@@ -1523,6 +1523,13 @@ class TestRunJobSkillBacked:
         assert final_response == "ok"
 
 
+class _UnreadableDeliveryPolicyJob(dict):
+    def get(self, key, default=None):
+        if key == "delivery_policy":
+            raise OSError("unreadable delivery policy")
+        return super().get(key, default)
+
+
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
@@ -1654,6 +1661,76 @@ class TestSilentDelivery:
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
         )
+
+    @pytest.mark.parametrize(
+        ("policy_job", "final_response", "expected_deliveries"),
+        [
+            pytest.param(
+                {"delivery_policy": "unknown_policy"}, "[SILENT]", 1,
+                id="unknown-policy-exact-silent",
+            ),
+            pytest.param(
+                {"delivery_policy": "unknown_policy"}, "Alert details\n[SILENT]", 1,
+                id="unknown-policy-trailing-silent",
+            ),
+            pytest.param(
+                {"delivery_policy": ["semantic_nonempty_v1"]}, "[SILENT]", 1,
+                id="malformed-policy-exact-silent",
+            ),
+            pytest.param(
+                _UnreadableDeliveryPolicyJob(delivery_policy="semantic_nonempty_v1"),
+                "[SILENT]", 1, id="unreadable-policy-exact-silent",
+            ),
+            pytest.param(
+                {"delivery_policy": "semantic_nonempty_v1"}, "[SILENT]", 0,
+                id="valid-policy-exact-silent",
+            ),
+            pytest.param({}, "[SILENT]", 0, id="absent-policy-exact-silent"),
+        ],
+    )
+    def test_save_compose_deliver_policy_silence_boundaries(
+        self, monkeypatch, policy_job, final_response, expected_deliveries,
+    ):
+        """Invalid config fails open while valid and absent policies keep their contracts."""
+        from cron import scheduler
+
+        job_values = {"id": "delivery-policy-test", "deliver": "local"}
+        job_values.update(dict.items(policy_job))
+        job = (
+            _UnreadableDeliveryPolicyJob(job_values)
+            if isinstance(policy_job, _UnreadableDeliveryPolicyJob)
+            else job_values
+        )
+        deliveries = []
+
+        monkeypatch.setattr(scheduler, "save_job_output", lambda _job_id, _output: None)
+        monkeypatch.setattr(scheduler, "self_removal_delivery_allowed", lambda _job_id: False)
+        monkeypatch.setattr(scheduler, "_is_interrupted", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            scheduler,
+            "_compose_run_delivery",
+            lambda _job, **kwargs: (kwargs["final_response"], False, False, False, None),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_deliver_result",
+            lambda *_args, **_kwargs: deliveries.append("delivered"),
+        )
+
+        delivery = scheduler._RunDelivery(job=job, success=True, error=None)
+        fence = scheduler._FireOwnership(job)
+        scheduler._save_compose_deliver(
+            delivery,
+            fence,
+            final_response,
+            "saved output",
+            adapters=None,
+            loop=None,
+            verbose=False,
+            execution_token=None,
+        )
+
+        assert len(deliveries) == expected_deliveries
 
     @pytest.mark.parametrize(
         (

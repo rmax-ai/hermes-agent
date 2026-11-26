@@ -2820,7 +2820,10 @@ def _save_compose_deliver(
         success=d.success is True and not fence.transport_cancelled(),
         final_response=final_response,
     )
-    policy_applied = decision[1] in {"semantic_empty", "exact_silent", "nonempty"}
+    # An invalid present policy fails open to delivery, not to legacy silence suppression.
+    policy_authoritative = decision[1] in {
+        "semantic_empty", "exact_silent", "nonempty", "config_invalid",
+    }
     d.semantic_empty_suppressed = decision == ("suppress", "semantic_empty")
     job_id = job.get("id")
     diagnostic_job_id = job_id[:64] if isinstance(job_id, str) else "?"
@@ -2851,12 +2854,12 @@ def _save_compose_deliver(
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
-    # The opt-in policy is deliberately stricter than the legacy matcher: only the exact whole
-    # response [SILENT] is control text; every other response is delivered verbatim.
-    if policy_applied:
+    # Valid policy decisions are stricter than the legacy matcher: only the exact whole response
+    # [SILENT] is control text; every other response is delivered verbatim.
+    if policy_authoritative:
         if decision[0] == "suppress":
             d.should_deliver = False
-    # Jobs without a valid policy keep the existing whole/first/last-line silence matcher.
+    # Jobs with no policy preserve the existing whole/first/last-line silence matcher.
     elif d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
         # Cron silence suppression — see _is_cron_silence_response. Replaces the old `SILENT_MARKER in
         # ...upper()` substring check, which both leaked bracketless near-markers ("SILENT" / "NO_REPLY")
