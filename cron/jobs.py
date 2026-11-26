@@ -30,7 +30,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
+from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,8 @@ def _ensure_croniter() -> bool:
 
 
 # --- Configuration ---
+
+CronDeliveryPolicy = Literal["semantic_nonempty_v1"]
 
 # Cron is per-profile by design: anchor at get_hermes_home() (active profile home), NOT
 # get_default_hermes_root() — the shared root would funnel every profile's jobs into one jobs.json
@@ -1773,6 +1775,7 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    delivery_policy: Optional[CronDeliveryPolicy] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1781,7 +1784,8 @@ def create_job(
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
-    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
+    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
+    delivery_policy: optional per-job response-delivery policy; omitted jobs retain legacy behavior."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1868,7 +1872,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
-        ("failure_deliver", f["failure_deliver"]),
+        ("failure_deliver", f["failure_deliver"]), ("delivery_policy", delivery_policy),
     ):
         if value is not None:
             job[key] = value
@@ -2039,6 +2043,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
+        if "delivery_policy" in updates and updates["delivery_policy"] is None:
+            updated.pop("delivery_policy", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

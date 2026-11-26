@@ -31,6 +31,8 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Protocol
 
+from pydantic import TypeAdapter
+
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -467,9 +469,10 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
-    _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
-    clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    CronDeliveryPolicy, _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire,
+    fire_claim_fence, clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
+    mark_job_run, save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope,
+    use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -477,6 +480,36 @@ from cron.executions import (
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
+_DELIVERY_POLICY_ADAPTER = TypeAdapter(CronDeliveryPolicy)
+
+
+def _decide_delivery_policy(
+    job: Any, *, success: Any, final_response: Any,
+) -> tuple[str, str]:
+    """Pure, fail-open decision for the opt-in job policy.
+
+    Only a known successful run with a readable supported policy may be filtered. Missing or
+    malformed metadata keeps the existing delivery path; missing/unknown results and failures
+    bypass filtering so their existing failure path remains visible.
+    """
+    if success is not True or not isinstance(final_response, str):
+        return "bypass", "failure"
+    try:
+        if "delivery_policy" not in job:
+            return "deliver", "config_absent"
+        policy = job.get("delivery_policy")
+    except Exception:
+        return "deliver", "config_invalid"
+    try:
+        _DELIVERY_POLICY_ADAPTER.validate_python(policy, strict=True)
+    except Exception:
+        return "deliver", "config_invalid"
+
+    if not final_response.strip():
+        return "suppress", "semantic_empty"
+    if final_response.strip() == SILENT_MARKER:
+        return "suppress", "exact_silent"
+    return "deliver", "nonempty"
 
 # Agent-declared failure marker for cron runs. Unlike SILENT, it is deliberately strict so a
 # report that merely quotes the token cannot turn a healthy run into a failed one.
@@ -497,8 +530,8 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
 
 
 def _is_cron_silence_response(text: str) -> bool:
-    """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
-    NO_REPLY / NO REPLY) as the whole response OR its own first/last line — NOT mid-sentence.
+    """Legacy silence matcher for default-policy delivery and run audit/fallback handling.
+    Strict-policy jobs use :func:`_decide_delivery_policy` at delivery time instead.
     Shares the webhook-lane matcher in :mod:`gateway.response_filters` so the two cannot drift.
 
     Recognizes the bracketed ``[SILENT]`` sentinel (whole-response, first line, or last line) plus the
@@ -2751,6 +2784,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    semantic_empty_suppressed: bool = False
 
 
 def _save_compose_deliver(
@@ -2779,6 +2813,30 @@ def _save_compose_deliver(
             "(tool subprocess was killed mid-flight)."
         )
 
+    # Evaluate the opt-in policy on the unwrapped final response, before delivery composition can
+    # add scheduler-owned notices or the delivery adapter can add its cost/header/footer envelope.
+    decision = _decide_delivery_policy(
+        job,
+        success=d.success is True and not fence.transport_cancelled(),
+        final_response=final_response,
+    )
+    # An invalid present policy fails open to delivery, not to legacy silence suppression.
+    policy_authoritative = decision[1] in {
+        "semantic_empty", "exact_silent", "nonempty", "config_invalid",
+    }
+    d.semantic_empty_suppressed = decision == ("suppress", "semantic_empty")
+    job_id = job.get("id")
+    diagnostic_job_id = job_id[:64] if isinstance(job_id, str) else "?"
+    if decision[1] == "config_invalid":
+        logger.warning(
+            "Job '%s': invalid delivery_policy; using existing delivery behavior "
+            "(decision=%s, reason=%s)",
+            diagnostic_job_id, *decision)
+    else:
+        logger.info(
+            "Job '%s': delivery policy decision=%s reason=%s",
+            diagnostic_job_id, *decision)
+
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
@@ -2796,9 +2854,13 @@ def _save_compose_deliver(
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
-    # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
-    # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
-    if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
+    # Valid policy decisions are stricter than the legacy matcher: only the exact whole response
+    # [SILENT] is control text; every other response is delivered verbatim.
+    if policy_authoritative:
+        if decision[0] == "suppress":
+            d.should_deliver = False
+    # Jobs with no policy preserve the existing whole/first/last-line silence matcher.
+    elif d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
         # Cron silence suppression — see _is_cron_silence_response. Replaces the old `SILENT_MARKER in
         # ...upper()` substring check, which both leaked bracketless near-markers ("SILENT" / "NO_REPLY")
         # and wrongly swallowed a real report that merely quoted "[SILENT]" mid-sentence (#51438, #46917).
@@ -3077,8 +3139,9 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
-        # Empty final_response is a soft failure so last_status is not "ok".
-        if d.success and not final_response.strip():
+        # Empty final_response remains a soft failure for legacy jobs; a successful opt-in
+        # semantic-empty suppression is a healthy run with no notification.
+        if d.success and not final_response.strip() and not d.semantic_empty_suppressed:
             d.success = False
             d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
