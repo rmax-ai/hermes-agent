@@ -1655,6 +1655,70 @@ class TestSilentDelivery:
             delivery_error=None,
         )
 
+    @pytest.mark.parametrize(
+        (
+            "success", "response", "policy", "error", "expected_delivery",
+            "expected_content", "expected_mark_success",
+        ),
+        [
+            (True, " \n\t ", "semantic_nonempty_v1", None, False, None, True),
+            (True, "[SILENT]", "semantic_nonempty_v1", None, False, None, True),
+            (
+                True, 'Alert: this report quotes "[SILENT]" as data.',
+                "semantic_nonempty_v1", None, True,
+                'Alert: this report quotes "[SILENT]" as data.', True,
+            ),
+            (
+                True, "Alert details\n[SILENT]", "semantic_nonempty_v1", None,
+                True, "Alert details\n[SILENT]", True,
+            ),
+            (True, "Critical alert", "unknown_policy", None, True, "Critical alert", True),
+            (True, "Critical alert", None, None, True, "Critical alert", True),
+            (False, "", "semantic_nonempty_v1", "request timed out", True, None, False),
+            (None, "", "semantic_nonempty_v1", "unknown terminal state", True, None, False),
+        ],
+    )
+    def test_semantic_nonempty_policy_filters_only_successful_strict_empty_responses(
+        self, success, response, policy, error, expected_delivery, expected_content,
+        expected_mark_success, caplog,
+    ):
+        job = self._make_job()
+        if policy is not None:
+            job["delivery_policy"] = policy
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(success, "# output", response, error),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value=None), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+                tick(verbose=False)
+
+        if expected_delivery:
+            deliver_mock.assert_called_once()
+            content = deliver_mock.call_args.args[1]
+            if expected_content is not None:
+                assert content == expected_content
+            else:
+                assert content
+        else:
+            deliver_mock.assert_not_called()
+
+        mark_mock.assert_called_once()
+        assert bool(mark_mock.call_args.args[1]) is expected_mark_success
+        if policy == "unknown_policy":
+            invalid_diagnostics = [
+                record.message for record in caplog.records
+                if "invalid delivery_policy" in record.message
+            ]
+            assert invalid_diagnostics
+            assert "unknown_policy" not in invalid_diagnostics[0]
+
 
 class TestOneShotDispatchClaim:
     """run_one_job must claim a finite one-shot's dispatch BEFORE run_job so a

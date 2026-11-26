@@ -75,7 +75,7 @@ def test_create_job_no_agent_error_still_wins(hermes_env):
 
 
 def test_valid_shapes_are_accepted(hermes_env):
-    from cron.jobs import create_job
+    from cron.jobs import create_job, update_job
 
     (hermes_env / "scripts" / "w.sh").write_text("echo hi\n")
 
@@ -92,6 +92,19 @@ def test_valid_shapes_are_accepted(hermes_env):
 
     prompt_job = create_job(prompt="check the news", schedule="every 5m", deliver="local")
     assert prompt_job["prompt"] == "check the news"
+    assert "delivery_policy" not in prompt_job
+
+    policy_job = create_job(
+        prompt="check for meaningful changes", schedule="every 5m", deliver="local",
+        delivery_policy="semantic_nonempty_v1",
+    )
+    assert policy_job["delivery_policy"] == "semantic_nonempty_v1"
+    updated_policy_job = update_job(
+        policy_job["id"], {"delivery_policy": "semantic_nonempty_v1"},
+    )
+    assert updated_policy_job["delivery_policy"] == "semantic_nonempty_v1"
+    cleared_policy_job = update_job(policy_job["id"], {"delivery_policy": None})
+    assert "delivery_policy" not in cleared_policy_job
 
     skills_job = create_job(
         prompt=None, schedule="every 5m", skills=["daily-report"], deliver="local"

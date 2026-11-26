@@ -8,6 +8,13 @@ from agent.turn_explainers import TurnExplainersMixin
 from cron.scheduler import _final_response_from_result
 
 
+class _UnreadablePolicyJob(dict):
+    def get(self, key, default=None):
+        if key == "delivery_policy":
+            raise OSError("unreadable policy")
+        return super().get(key, default)
+
+
 class _AIAgent:
     _format_turn_completion_explanation = staticmethod(TurnExplainersMixin._format_turn_completion_explanation)
 
@@ -29,3 +36,36 @@ def test_a_failed_turn_still_raises_so_the_job_is_marked_failed():
               "turn_exit_reason": "repeated_outer_errors(x)", "messages": [], "api_calls": 3}
     with pytest.raises(RuntimeError):
         _final_response_from_result(result, "job1", "Morning brief", _AIAgent)
+
+
+@pytest.mark.parametrize(
+    ("job", "success", "final_response", "expected"),
+    [
+        ({}, True, "Alert", ("deliver", "config_absent")),
+        ({"delivery_policy": "future_policy"}, True, "Alert", ("deliver", "config_invalid")),
+        ({"delivery_policy": ["semantic_nonempty_v1"]}, True, "Alert", ("deliver", "config_invalid")),
+        ({"delivery_policy": None}, True, "Alert", ("deliver", "config_invalid")),
+        (_UnreadablePolicyJob(delivery_policy="semantic_nonempty_v1"), True, "Alert", ("deliver", "config_invalid")),
+        ({"delivery_policy": "semantic_nonempty_v1"}, False, "[SILENT]", ("bypass", "failure")),
+        ({"delivery_policy": "semantic_nonempty_v1"}, "unknown", "", ("bypass", "failure")),
+        ({"delivery_policy": "semantic_nonempty_v1"}, True, None, ("bypass", "failure")),
+        ({"delivery_policy": "semantic_nonempty_v1"}, True, " \n\t ", ("suppress", "semantic_empty")),
+        ({"delivery_policy": "semantic_nonempty_v1"}, True, " \n[SILENT]\t ", ("suppress", "exact_silent")),
+        (
+            {"delivery_policy": "semantic_nonempty_v1"}, True,
+            'Alert: the report quotes "[SILENT]" as data.',
+            ("deliver", "nonempty"),
+        ),
+        (
+            {"delivery_policy": "semantic_nonempty_v1"}, True,
+            "Alert details\n[SILENT]",
+            ("deliver", "nonempty"),
+        ),
+    ],
+)
+def test_delivery_policy_decisions_are_strict_and_fail_open(job, success, final_response, expected):
+    from cron.scheduler import _decide_delivery_policy
+
+    assert _decide_delivery_policy(
+        job, success=success, final_response=final_response,
+    ) == expected
