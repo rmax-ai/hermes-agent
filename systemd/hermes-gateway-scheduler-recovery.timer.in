@@ -1,0 +1,13 @@
+# Template only. Install and enable only after Max approves the reviewed unit diff.
+[Unit]
+Description=Observe Hermes gateway scheduler progress
+ConditionPathExists="@APPROVAL_FILE@"
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=@RECOVERY_SERVICE_UNIT@
+
+[Install]
+WantedBy=timers.target

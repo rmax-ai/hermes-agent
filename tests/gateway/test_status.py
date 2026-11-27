@@ -1077,6 +1077,21 @@ class TestPlannedStopMarker:
         assert payload["stopper_pid"] == os.getpid()
         assert "written_at" in payload
 
+    def test_external_process_probe_uses_explicit_home_and_identity(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 42)
+        status.write_planned_stop_marker(target_pid=12345)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ambient"))
+
+        assert status.planned_stop_marker_targets_process(
+            12345, 42, hermes_home=tmp_path
+        )
+        assert not status.planned_stop_marker_targets_process(
+            12345, 43, hermes_home=tmp_path
+        )
+
 
     def test_consume_returns_true_on_windows_when_start_time_unavailable(
         self, tmp_path, monkeypatch

@@ -1,0 +1,12 @@
+# Template only. Do not install or activate before Max approves the reviewed unit diff.
+[Unit]
+Description=Hermes gateway scheduler recovery observer
+ConditionPathExists="@APPROVAL_FILE@"
+
+[Service]
+Type=oneshot
+WorkingDirectory="@PACKAGE_ROOT@"
+Environment="HERMES_HOME=@HERMES_HOME@"
+Environment="PYTHONPATH=@PACKAGE_ROOT@"
+ExecStart="@PYTHON@" -m gateway.scheduler_recovery --home "@HERMES_HOME@" --unit "@GATEWAY_UNIT@" --scope user --approval-file "@APPROVAL_FILE@"
+TimeoutStartSec=90s

@@ -5466,8 +5466,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
+    _write_runtime_status_quiet(
+        scheduler_provider=getattr(cron_provider, "name", "unknown"),
+    )
 
-    # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
+    await runner._await_scheduler_ready_for_systemd(cron_provider)
+
+    # READY only once adapters, cron, housekeeping and two built-in scheduler ticks have run.
     runner._start_systemd_watchdog()
 
     await runner.wait_for_shutdown()

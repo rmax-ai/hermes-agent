@@ -832,7 +832,10 @@ class GatewayStartupMixin:
             _profile = get_active_profile_name()  # launch profile, pre-identity (boot log)
             if _profile and _profile != "default":
                 logger.info("Active profile: %s", _profile)
-        _write_runtime_status_quiet(gateway_state="starting", exit_reason=None, clear_profile_platforms=True)
+        _write_runtime_status_quiet(
+            gateway_state="starting", exit_reason=None, clear_profile_platforms=True,
+            gateway_banner=None, scheduler_provider=None,
+        )
         with _log_suppressed(logging.DEBUG, "gateway health OTLP export startup failed", exc_info=True):
             from hermes_cli.config import load_config
             from agent.monitoring.gateway_health_export import start_gateway_health_export
@@ -1320,9 +1323,38 @@ class GatewayStartupMixin:
         )
         return False
 
+    async def _await_scheduler_ready_for_systemd(self, cron_provider) -> None:
+        """Delay Type=notify readiness until the built-in ticker has completed two ticks."""
+        if self.config.systemd_watchdog_seconds <= 0:
+            return
+        from cron.scheduler_provider import InProcessCronScheduler
+        from gateway.systemd_notify import notify, watchdog_interval_seconds
+
+        if not isinstance(cron_provider, InProcessCronScheduler):
+            return
+        if watchdog_interval_seconds() is None:
+            return
+        from gateway.run import _hermes_home
+        from gateway.scheduler_recovery import scheduler_readiness
+        from gateway.status import read_runtime_status
+
+        last_extension: float | None = None
+        while self._running and not self.should_exit_cleanly:
+            status = scheduler_readiness(_hermes_home, read_runtime_status() or {})
+            if status.get("status") == "ok":
+                return
+            now = time.monotonic()
+            if last_extension is None or now - last_extension >= 30:
+                notify(
+                    "EXTEND_TIMEOUT_USEC=90000000\n"
+                    "STATUS=Waiting for verified scheduler ticks"
+                )
+                last_extension = now
+            await asyncio.sleep(1)
+
     async def _start_post_connect_services(self, connected_count: int) -> None:
         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
-        from gateway.run import _hermes_home
+        from gateway.run import _hermes_home, _write_runtime_status_quiet
         try:
             await self._ensure_hosted_room_worker()
         except Exception:
@@ -1339,8 +1371,13 @@ class GatewayStartupMixin:
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
         await self.hooks.emit("gateway:startup", {"platforms": [p.value for p in self.adapters]})
+        banner = (
+            f"Gateway running with {connected_count} platform(s)"
+            if connected_count > 0 else "Gateway will continue for cron job execution"
+        )
         if connected_count > 0:
-            logger.info("Gateway running with %s platform(s)", connected_count)
+            logger.info("%s", banner)
+        _write_runtime_status_quiet(gateway_banner=banner)
         # Initial channel directory for send_message name resolution
         with _log_suppressed(logging.WARNING, "Channel directory build failed: %s"):
             from gateway.channel_directory import build_channel_directory
